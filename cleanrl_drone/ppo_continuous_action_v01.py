@@ -2,9 +2,11 @@
 import os
 import random
 import time
+import copy
 from dataclasses import dataclass
 
 import gymnasium as gym
+import custom_envs
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,12 +15,15 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
+from cleanrl_drone.deploy_policy import DronePolicy
+
+# This script is specifically for dji_f450.py.
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 4
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
@@ -40,7 +45,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "HalfCheetah-v4"
+    env_id: str = "custom_envs/DJIF450-v0"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -50,7 +55,7 @@ class Args:
     """the number of parallel game environments"""
     num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout"""
-    anneal_lr: bool = False
+    anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
     """the discount factor gamma"""
@@ -86,11 +91,7 @@ class Args:
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
+        env = gym.make(env_id)
         env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
@@ -101,6 +102,15 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         return env
 
     return thunk
+
+
+def find_normalize_observation_wrapper(env):
+    while True:
+        if isinstance(env, gym.wrappers.NormalizeObservation):
+            return env
+        if not hasattr(env, "env"):
+            raise RuntimeError("NormalizeObservation wrapper not found; cannot export deployment policy")
+        env = env.env
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -146,7 +156,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{time.strftime('%Y%m%d_%H%M%S')}"
     if args.track:
         import wandb
 
@@ -327,6 +337,21 @@ if __name__ == "__main__":
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
+
+        normalize_obs_wrapper = find_normalize_observation_wrapper(envs.envs[0])
+        deploy_agent = DronePolicy(
+            actor=copy.deepcopy(agent.actor_mean).cpu(),
+            obs_mean=normalize_obs_wrapper.obs_rms.mean,
+            obs_var=normalize_obs_wrapper.obs_rms.var,
+            obs_epsilon=normalize_obs_wrapper.epsilon,
+            action_low=envs.single_action_space.low,
+            action_high=envs.single_action_space.high,
+        )
+        deploy_agent.eval()
+        deploy_path = f"runs/{run_name}/{args.exp_name}.deploy_policy.pt"
+        torch.save(deploy_agent, deploy_path)
+        print(f"deployment policy saved to {deploy_path}")
+
         from cleanrl_utils.evals.ppo_eval import evaluate
 
         episodic_returns = evaluate(
