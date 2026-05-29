@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_drone.deploy_policy import DronePolicy
 
-# This script is specifically for dji_f450_res_acc.py.
+# This script is specifically for dji_f450.py.
 
 @dataclass
 class Args:
@@ -45,7 +45,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "custom_envs/DJIF450-v1"
+    env_id: str = "custom_envs/TacDroneHover-v0"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -75,7 +75,7 @@ class Args:
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
-    max_grad_norm: float = 0.25
+    max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""

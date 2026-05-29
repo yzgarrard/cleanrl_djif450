@@ -57,6 +57,8 @@ class DJIF450EnvV1p0(gym.Env):
         # 
         self.last_action = np.array([0, 0, 0], dtype=np.float32)
         self.last_acc_sp_pid = np.array([0, 0, 0], dtype=np.float32)
+        #
+        self.action_scale = np.array([10.0, 10.0, 10.0], dtype=np.float32)
         
         ## Observation space: 13-dimensional space
         # Position (x, y, z) in NED frame
@@ -79,16 +81,24 @@ class DJIF450EnvV1p0(gym.Env):
         ## Action space: 3-dimensional vector
         # Action: desired (ax, ay, az) acceleration in NED frame
         self.action_space = spaces.Box(
-            low=np.array([-10,-10,-10]), 
-            high=np.array([10,10,10]), 
+            low=np.array([-1,-1,-1]), 
+            high=np.array([1,1,1]), 
             shape=(3,), 
             dtype=np.float32)
         
     def _get_obs(self):
         # Return the current observation
+        # Compute the PID controller signal
+        pos = self._agent_pose[:3]
+        vel = self._agent_pose[3:6]
+        
+        pos_error = -pos  # Desired position is (0, 0, 0)
+        vel_sp = self.MPC_XYZ_POS_P @ pos_error
+        vel_error = vel_sp - vel
+        acc_sp_pid = self.MPC_XYZ_VEL_P @ vel_error - self.MPC_XYZ_VEL_D @ vel
         return np.concatenate([self._agent_pose.copy(), 
-                               self.last_acc_sp_pid.copy(), 
-                               self.last_action.copy()], 
+                               self.last_action.copy(),
+                               acc_sp_pid.copy()], 
                               dtype=np.float32)
     
     def _get_info(self):
@@ -108,13 +118,14 @@ class DJIF450EnvV1p0(gym.Env):
              0.0, 0.0, 0.0], 
             dtype=np.float32)
         self._agent_pose[0:3] = self.np_random.uniform(-0.2, 0.2, 3)
-        # self._agent_pose[0:3] = np.array([-1 , -1, -1], dtype=np.float32)
+        # self._agent_pose[0:3] = self.np_random.uniform(-1, 1, 3)
         # self._agent_pose[3:6] = self.np_random.uniform(-1, 1, 3)
         self._agent_pose[3:6] = np.array([0, 0, 0], dtype=np.float32)
         self.motor_rpm = np.array([6500, 6500, 6500, 6500], dtype=np.float32)
         self.collective_thrust = -self.m * self.g
         self.torque = np.array([0, 0, 0], dtype=np.float32)
         self.last_action = np.array([0, 0, 0], dtype=np.float32)
+        self.last_acc_sp_pid = np.array([0, 0, 0], dtype=np.float32)
         return self._get_obs(), self._get_info()
     
     def step(self, action):
@@ -126,11 +137,13 @@ class DJIF450EnvV1p0(gym.Env):
         
         pos_error = -pos  # Desired position is (0, 0, 0)
         vel_sp = self.MPC_XYZ_POS_P @ pos_error
-        vel_error = -vel
+        vel_error = vel_sp - vel
         acc_sp_pid = self.MPC_XYZ_VEL_P @ vel_error - self.MPC_XYZ_VEL_D @ vel
         
-        acc_sp_total = acc_sp_pid + action
+        residual_acc = self.action_scale * np.clip(action, -1, 1)
+        acc_sp_total = np.clip(acc_sp_pid + residual_acc, -10, 10)
 
+        acc_sp_total = np.clip(acc_sp_total, -10, 10)
 
         ## Compute thrust setpoint
         # https://github.com/PX4/PX4-Autopilot/blob/e4d46f20f439094862eedd7e21c5abeefb1721f1/src/modules/mc_pos_control/PositionControl/PositionControl.cpp#L207
@@ -157,7 +170,7 @@ class DJIF450EnvV1p0(gym.Env):
         
         # Project thrust to planned body attitude
         cos_ned_body = np.dot(np.array([0,0,1]), body_z)
-        collective_thrust = thrust_ned_z / cos_ned_body
+        collective_thrust = min(thrust_ned_z / cos_ned_body, -0.001)
         
         thrust_sp = body_z * collective_thrust
         
@@ -165,7 +178,8 @@ class DJIF450EnvV1p0(gym.Env):
         
         yaw_sp = 0
         
-        body_z = body_z / np.linalg.norm(body_z)
+        # body_z = body_z / np.linalg.norm(body_z)
+        body_z = -thrust_sp / np.linalg.norm(-thrust_sp)
         
         # vector of desired yaw direction in XY plane, rotate by PI/2
         y_C = np.array([-np.sin(yaw_sp), np.cos(yaw_sp), 0.0])
@@ -251,9 +265,9 @@ class DJIF450EnvV1p0(gym.Env):
         # reward = -np.linalg.norm(pos)
         reward = (
             -1*np.linalg.norm(pos) + 
-            -(3-np.trace(rotm @ rotm_desired)) +
-            -0.01*np.linalg.norm(action) +
-            -0.02*np.linalg.norm(self.last_action - action) +
+            -(3-np.trace(rotm.T @ rotm_desired)) +
+            -0.1*(np.linalg.norm(omega) + 2*np.linalg.norm(omega_dot)) +
+            -0.01*(np.linalg.norm(action) + 2*np.linalg.norm(self.last_action - action)) +
             0.1
         )
 

@@ -104,7 +104,7 @@ class DJIF450EnvV0p0(gym.Env):
              0.0, 0.0, 0.0], 
             dtype=np.float32)
         self._agent_pose[0:3] = self.np_random.uniform(-0.2, 0.2, 3)
-        # self._agent_pose[0:3] = np.array([-1 , -1, -1], dtype=np.float32)
+        # self._agent_pose[0:3] = self.np_random.uniform(-1, 1, 3)
         # self._agent_pose[3:6] = self.np_random.uniform(-1, 1, 3)
         self._agent_pose[3:6] = np.array([0, 0, 0], dtype=np.float32)
         self.motor_rpm = np.array([6500, 6500, 6500, 6500], dtype=np.float32)
@@ -124,6 +124,7 @@ class DJIF450EnvV0p0(gym.Env):
         ## Compute thrust setpoint
         # https://github.com/PX4/PX4-Autopilot/blob/e4d46f20f439094862eedd7e21c5abeefb1721f1/src/modules/mc_pos_control/PositionControl/PositionControl.cpp#L207
         z_specific_force = -self.g
+        z_specific_force += action[2]
         # Assume standard acceleration due to gravity in the vertical direction for attitude generation,
         # i.e., the line below describes the orientation the drone needs to be in to generate thrust
         # in the action[0:1] direction.
@@ -146,7 +147,7 @@ class DJIF450EnvV0p0(gym.Env):
         
         # Project thrust to planned body attitude
         cos_ned_body = np.dot(np.array([0,0,1]), body_z)
-        collective_thrust = thrust_ned_z / cos_ned_body
+        collective_thrust = min(thrust_ned_z / cos_ned_body, -0.001)
         
         thrust_sp = body_z * collective_thrust
         
@@ -154,7 +155,8 @@ class DJIF450EnvV0p0(gym.Env):
         
         yaw_sp = 0
         
-        body_z = body_z / np.linalg.norm(body_z)
+        # body_z = body_z / np.linalg.norm(body_z)
+        body_z = -thrust_sp / np.linalg.norm(-thrust_sp)
         
         # vector of desired yaw direction in XY plane, rotate by PI/2
         y_C = np.array([-np.sin(yaw_sp), np.cos(yaw_sp), 0.0])
@@ -220,29 +222,11 @@ class DJIF450EnvV0p0(gym.Env):
         rotm = R.from_quat(self._agent_pose[6:10], scalar_first=True).as_matrix()
         rotm_desired = R.from_quat(quat_sp, scalar_first=True).as_matrix()
         
-        # reward = (-self.pos_reward_weight * np.linalg.norm(self._agent_pose[0:3])**2 +
-        #           -self.vel_reward_weight * np.linalg.norm(self._agent_pose[3:6])**2 +
-        #           -self.quat_reward_weight * (1-self._agent_pose[6])**2 +
-        #           -self.omega_reward_weight * np.linalg.norm(self._agent_pose[10:13])**2 +
-        #           -self.action_reward_weight * np.linalg.norm(action)**2 +
-        #           self.survival_reward)
-        # reward = (-self.pos_reward_weight * np.linalg.norm(self._agent_pose[0:3])**2 +
-        #           -self.vel_reward_weight * np.linalg.norm(self._agent_pose[3:6])**2 +
-        #           -self.quat_reward_weight * (1-self._agent_pose[6])**2 +
-        #           -self.omega_reward_weight * np.linalg.norm(self._agent_pose[10:13])**2 +
-        #           -self.action_reward_weight * np.linalg.norm(action)**2)
-        # reward = (
-        #     -8.0 * np.linalg.norm(pos)
-        #     -2.0 * np.linalg.norm(vel)
-        #     -0.05 * np.linalg.norm(action)
-        #     -0.02 * np.linalg.norm(self.last_action - action)
-        #     )
-        # reward = -np.linalg.norm(pos)
         reward = (
             -1*np.linalg.norm(pos) + 
-            -(3-np.trace(rotm @ rotm_desired)) +
-            -0.01*np.linalg.norm(action) +
-            -0.02*np.linalg.norm(self.last_action - action) +
+            -(3-np.trace(rotm.T @ rotm_desired)) +
+            -0.1*(np.linalg.norm(omega) + 2*np.linalg.norm(omega_dot)) +
+            -0.01*(np.linalg.norm(action) + 2*np.linalg.norm(self.last_action - action)) +
             0.1
         )
 

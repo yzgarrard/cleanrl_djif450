@@ -17,7 +17,7 @@ observation, info = env.reset(seed=seed)
 sim_length_steps = 1000
 observation_history = np.zeros((sim_length_steps, len(observation)), dtype=np.float32)
 agent = torch.load(
-    "/home/yzgar/cleanrl/runs/custom_envs/DJIF450-v0__ppo_continuous_action_v01__4__20260529_065416/ppo_continuous_action_v01.deploy_policy.pt",
+    "/home/yzgar/cleanrl/runs/custom_envs/DJIF450-v1__ppo_res_acc_v01__4__20260529_101234/ppo_res_acc_v01.deploy_policy.pt",
     map_location="cpu",
     weights_only=False,
 )
@@ -33,7 +33,7 @@ for i in range(sim_length_steps):
     
 print(f"Cumulative Reward: {reward_total:.2f}")
 
-fig, axs = plt.subplots(3, 1, figsize=(10, 15))
+fig, axs = plt.subplots(3, 1)
 axs[0].plot(observation_history[:, 0], label='x')
 axs[0].plot(observation_history[:, 1], label='y')
 axs[0].plot(observation_history[:, 2], label='z')

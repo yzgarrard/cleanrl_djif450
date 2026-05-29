@@ -35,7 +35,7 @@ for i in range(sim_length_steps):
 
 print(f"Cumulative Reward: {reward_total:.2f}")
 
-fig, axs = plt.subplots(3, 1, figsize=(10, 15))
+fig, axs = plt.subplots(3, 1)
 axs[0].plot(observation_history[:, 0], label='x')
 axs[0].plot(observation_history[:, 1], label='y')
 axs[0].plot(observation_history[:, 2], label='z')
