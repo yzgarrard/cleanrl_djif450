@@ -40,10 +40,10 @@
     </worldbody>
 
     <actuator>
-        <motor name="thrust1" site="thrust1" forcelimited="true" forcerange="0 10" gear="0 0 1 0 0 .0074"/>
-        <motor name="thrust2" site="thrust2" forcelimited="true" forcerange="0 10" gear="0 0 1 0 0 .0074"/>
-        <motor name="thrust3" site="thrust3" forcelimited="true" forcerange="0 10" gear="0 0 1 0 0 -.0074"/>
-        <motor name="thrust4" site="thrust4" forcelimited="true" forcerange="0 10" gear="0 0 1 0 0 -.0074"/>
+        <motor name="thrust1" site="thrust1" forcelimited="true" forcerange="0 10" gear="0 0 1 0 0 -.0167"/>
+        <motor name="thrust2" site="thrust2" forcelimited="true" forcerange="0 10" gear="0 0 1 0 0 -.0167"/>
+        <motor name="thrust3" site="thrust3" forcelimited="true" forcerange="0 10" gear="0 0 1 0 0 .0167"/>
+        <motor name="thrust4" site="thrust4" forcelimited="true" forcerange="0 10" gear="0 0 1 0 0 .0167"/>
     </actuator>
 
     <sensor>

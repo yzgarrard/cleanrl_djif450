@@ -10,10 +10,10 @@ import custom_envs  # noqa: F401 - registers custom Gymnasium environments
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ENV_ID = "custom_envs/TacDroneHover-v0"
+DEFAULT_ENV_ID = "custom_envs/TacDroneHover-v4"
 DEFAULT_POLICY_GLOB = (
-    "runs/custom_envs/TacDroneHover-v0__ppo_mujoco_v01__*/"
-    "ppo_mujoco_v01.deploy_policy.pt"
+    "runs/custom_envs/TacDroneHover-v4__ppo_mujoco_v04__*/"
+    "ppo_mujoco_v04.deploy_policy.pt"
 )
 
 

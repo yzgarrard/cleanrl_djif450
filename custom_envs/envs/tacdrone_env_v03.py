@@ -20,7 +20,7 @@ class TacDroneHoverEnvV03(gym.Env):
     ## Observation Space  (Box, shape=(19,), dtype=float32)
     Index | Quantity
     ------|----------------------------------------------------------
-    0-2   | Position error  ex, ey, ez  (world frame)
+    0-2   | Position  x, y, z  (world frame)
     3-6   | Quaternion  qw, qx, qy, qz
     7-9   | Linear velocity  vx, vy, vz  (world frame)
     10-12 | Angular velocity  wx, wy, wz  (body frame, gyro)
@@ -29,7 +29,7 @@ class TacDroneHoverEnvV03(gym.Env):
     17-18 | xy displacement from spawn  (dx, dy)
 
     ## Action Space  (Box, shape=(4,), dtype=float32)
-    Normalised motor commands in [-1, 1] (re-scaled to [0, 13.5] N inside step).
+    Normalised motor commands in [-1, 1] (re-scaled to [0, 10.0] N inside step).
     Using symmetric [-1,1] per SB3 recommendation.
     """
 
@@ -52,8 +52,8 @@ class TacDroneHoverEnvV03(gym.Env):
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data  = mujoco.MjData(self.model)
 
-        self.frame_skip  = 2
-        self.max_thrust  = 10
+        self.frame_skip  = 1
+        self.max_thrust  = 10.0
 
         # --- Spaces ---
         obs_low  = np.full(19, -np.inf, dtype=np.float32)
@@ -66,12 +66,6 @@ class TacDroneHoverEnvV03(gym.Env):
             high =  np.ones(4, dtype=np.float32),
             dtype=np.float32,
         )
-        
-        self.des_pos = np.array([0.0, 0.0, self.target_z], dtype=np.float32)
-        
-        # Physical constants
-        self.motor_time_constant = 0.059  # seconds, for first-order motor delay approximation
-        self.alpha = np.exp(-0.01/self.motor_time_constant)  # assuming dt of 0.01 seconds
 
         # --- Reward weights ---
         self.w_z    = 3.0
@@ -84,7 +78,6 @@ class TacDroneHoverEnvV03(gym.Env):
 
         # --- Rendering (only used when render_mode="human" on eval env) ---
         self._viewer   = None
-        self._viewer_launched = False
         self._renderer = None
         self._step_count = 0
         self._init_xy    = np.zeros(2)
@@ -113,9 +106,8 @@ class TacDroneHoverEnvV03(gym.Env):
         pos  = self.data.qpos[:3]
         vel  = self.data.qvel[:3]
         gyro = self.data.sensor("body_gyro").data
-        z_err  = self.des_pos[2] - pos[2]
-        # xy_err = float(np.linalg.norm(pos[:2] - self._init_xy))
-        xy_err = float(np.linalg.norm(self.des_pos[:2] - pos[:2]))
+        z_err  = self.target_z - pos[2]
+        xy_err = float(np.linalg.norm(pos[:2] - self._init_xy))
         tilt   = self._tilt_angle()
         return float(
               self.alive
@@ -131,8 +123,8 @@ class TacDroneHoverEnvV03(gym.Env):
         pos  = self.data.qpos[:3]
         tilt = self._tilt_angle()
         if pos[2] < 0.05:                            return True
-        if abs(self.des_pos[2] - pos[2]) > 3.0:        return True
-        # if abs(pos[0]) > 5.0 or abs(pos[1]) > 5.0:  return True
+        if abs(self.target_z - pos[2]) > 3.0:        return True
+        if abs(pos[0]) > 5.0 or abs(pos[1]) > 5.0:  return True
         if tilt > np.deg2rad(60):                     return True
         return False
 
@@ -146,7 +138,7 @@ class TacDroneHoverEnvV03(gym.Env):
         rng = self.np_random
         self.data.qpos[0] += rng.uniform(-0.05, 0.05)
         self.data.qpos[1] += rng.uniform(-0.05, 0.05)
-        self.data.qpos[2]  = 0.135 + rng.uniform(0, 0.1)
+        self.data.qpos[2]  = 0.135 + rng.uniform(-0.02, 0.02)
 
         axis  = rng.standard_normal(3)
         axis /= np.linalg.norm(axis) + 1e-8
@@ -165,14 +157,9 @@ class TacDroneHoverEnvV03(gym.Env):
     def step(self, action: np.ndarray):
         # Rescale [-1,1] → [0, max_thrust]
         ctrl_cmd = (np.clip(action, -1.0, 1.0) + 1.0) * 0.5 * self.max_thrust
-        
-        # Set the thrust of the motor instantly
-        # self.data.ctrl[:] = ctrl_cmd
-        
+        self.data.ctrl[:] = ctrl_cmd
 
         for _ in range(self.frame_skip):
-            # Set the thrust of the motor accounting for motor delay
-            self.data.ctrl[:] = self.alpha*self.data.ctrl[:] + (1-self.alpha)*ctrl_cmd
             mujoco.mj_step(self.model, self.data)
 
         obs        = self._get_obs()
@@ -193,11 +180,10 @@ class TacDroneHoverEnvV03(gym.Env):
     # ------------------------------------------------------------------ #
     def render(self):
         if self.render_mode == "human":
-            if not self._viewer_launched:
+            if self._viewer is None:
                 import mujoco.viewer as mjv
                 self._viewer = mjv.launch_passive(self.model, self.data)
-                self._viewer_launched = True
-            if self._viewer is not None and self._viewer.is_running():
+            if self._viewer.is_running():
                 self._viewer.sync()
 
         elif self.render_mode == "rgb_array":
@@ -210,7 +196,6 @@ class TacDroneHoverEnvV03(gym.Env):
         if self._viewer is not None:
             self._viewer.close()
             self._viewer = None
-        self._viewer_launched = False
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None

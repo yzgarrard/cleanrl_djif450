@@ -4,6 +4,8 @@ TacDrone Hovering - Custom Gymnasium Environment
 Fixed version: render_mode="human" is intentionally NOT used during
 training to avoid Wayland/GLFW + DummyVecEnv segfault.
 Rendering is handled externally via RenderCallback in the train script.
+
+V4 uses thrust+angular rates rather than direct motor commands
 """
 
 import os
@@ -11,11 +13,12 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import mujoco
+from scipy.spatial.transform import Rotation as R
 
 _DEFAULT_XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tacdrone.xml")
 
 
-class TacDroneHoverEnv(gym.Env):
+class TacDroneHoverEnvV04(gym.Env):
     """
     ## Observation Space  (Box, shape=(19,), dtype=float32)
     Index | Quantity
@@ -29,7 +32,9 @@ class TacDroneHoverEnv(gym.Env):
     17-18 | xy displacement from spawn  (dx, dy)
 
     ## Action Space  (Box, shape=(4,), dtype=float32)
-    Normalised motor commands in [-1, 1] (re-scaled to [0, 13.5] N inside step).
+    Normalised thrust and angular rates in [-1, 1] (re-scaled to [0, 10.0] N and [rad/s] inside step).
+    Angular rates are in xyz directions (or pqr, or roll/pitch/yaw rate) in the body frame.
+    euler rates aren't actually euler rates, but are in body frame.
     Using symmetric [-1,1] per SB3 recommendation.
     """
 
@@ -52,8 +57,34 @@ class TacDroneHoverEnv(gym.Env):
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data  = mujoco.MjData(self.model)
 
-        self.frame_skip  = 2
-        self.max_thrust  = 13.50
+        self.frame_skip  = 1
+        self.max_thrust  = 40.0     # total thrust, not per motor
+        self.dt = self.model.opt.timestep * self.frame_skip
+        
+        # Things for rate control
+        self.MC_PITCHRATE_P = 0.15
+        self.MC_PITCHRATE_I = 0.2
+        self.MC_PITCHRATE_D = 0.003
+        self.MC_ROLLRATE_P  = 0.15
+        self.MC_ROLLRATE_I  = 0.2
+        self.MC_ROLLRATE_D  = 0.003
+        self.MC_YAWRATE_P   = 0.2
+        self.MC_YAWRATE_I   = 0.1
+        self.MC_YAWRATE_D   = 0.0
+        self.pitchrate_err_accum = 0.0
+        self.rollrate_err_accum  = 0.0
+        self.yawrate_err_accum   = 0.0
+        s45 = np.sin(np.deg2rad(45)) # arm angle
+        d = 0.225   # Arm length
+        K_tau = 0.0167  # Torque coefficient
+        self.CAM = np.array([
+            [1.0, 1.0, 1.0, 1.0],
+            [-d*s45, d*s45, d*s45, -d*s45],
+            [-d*s45, d*s45, -d*s45, d*s45],
+            [-K_tau, -K_tau, K_tau, K_tau]
+            ])
+        self.CAM_inv = np.linalg.inv(self.CAM)
+        self.max_i_torque = np.array([0.03, 0.03, 0.01], dtype=np.float32) # anti-windup limits for the integral term of the rate controller
 
         # --- Spaces ---
         obs_low  = np.full(19, -np.inf, dtype=np.float32)
@@ -73,14 +104,16 @@ class TacDroneHoverEnv(gym.Env):
         self.w_vel  = 0.2
         self.w_ang  = 0.1
         self.w_tilt = 2.0
+        self.w_yaw = 1.0
         self.w_act  = 0.05
         self.alive  = 1.0
 
         # --- Rendering (only used when render_mode="human" on eval env) ---
-        self._viewer   = None
+        self._viewer = None
+        self._viewer_launched = False
         self._renderer = None
         self._step_count = 0
-        self._init_xy    = np.zeros(2)
+        self._init_xy = np.zeros(2)
 
     # ------------------------------------------------------------------ #
     #  Internals                                                           #
@@ -109,6 +142,9 @@ class TacDroneHoverEnv(gym.Env):
         z_err  = self.target_z - pos[2]
         xy_err = float(np.linalg.norm(pos[:2] - self._init_xy))
         tilt   = self._tilt_angle()
+        quat = self.data.qpos[3:7]
+        eul = R.from_quat(quat, scalar_first=True).as_euler("zyx", degrees=False)
+        yaw = eul[0]
         return float(
               self.alive
             - self.w_z    * z_err**2
@@ -116,6 +152,7 @@ class TacDroneHoverEnv(gym.Env):
             - self.w_vel  * float(np.dot(vel, vel))
             - self.w_ang  * float(np.dot(gyro, gyro))
             - self.w_tilt * tilt**2
+            - self.w_yaw  * yaw**2
             - self.w_act  * float(np.sum(action_normed**2))
         )
 
@@ -139,6 +176,10 @@ class TacDroneHoverEnv(gym.Env):
         self.data.qpos[0] += rng.uniform(-0.05, 0.05)
         self.data.qpos[1] += rng.uniform(-0.05, 0.05)
         self.data.qpos[2]  = 0.135 + rng.uniform(-0.02, 0.02)
+        
+        self.pitchrate_err_accum = 0.0
+        self.rollrate_err_accum  = 0.0
+        self.yawrate_err_accum   = 0.0
 
         axis  = rng.standard_normal(3)
         axis /= np.linalg.norm(axis) + 1e-8
@@ -156,8 +197,45 @@ class TacDroneHoverEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         # Rescale [-1,1] → [0, max_thrust]
-        ctrl_cmd = (np.clip(action, -1.0, 1.0) + 1.0) * 0.5 * self.max_thrust
-        self.data.ctrl[:] = ctrl_cmd
+        thrust_sp = (np.clip(action[0], -1.0, 1.0) + 1.0) * 0.5 * self.max_thrust
+        omega_sp = np.clip(action[1:], -1.0, 1.0) # Keep body rates within 1 rad/s
+        omega = self.data.sensor("body_gyro").data.copy()
+        omega_err = omega_sp - omega
+        
+        self.rollrate_err_accum += omega_err[0]*self.dt
+        self.pitchrate_err_accum += omega_err[1]*self.dt
+        self.yawrate_err_accum   += omega_err[2]*self.dt
+        
+        # i_limits = self.max_i_torque / np.array([
+        #     self.MC_ROLLRATE_I,
+        #     self.MC_PITCHRATE_I,
+        #     self.MC_YAWRATE_I,
+        # ])
+        
+        # self.rollrate_err_accum = np.clip(self.rollrate_err_accum, -i_limits[0], i_limits[0])
+        # self.pitchrate_err_accum = np.clip(self.pitchrate_err_accum, -i_limits[1], i_limits[1])
+        # self.yawrate_err_accum = np.clip(self.yawrate_err_accum, -i_limits[2], i_limits[2])
+
+        
+        tau_sp_P = np.array([
+            self.MC_ROLLRATE_P * omega_err[0],
+            self.MC_PITCHRATE_P * omega_err[1],
+            self.MC_YAWRATE_P   * omega_err[2]
+        ])
+        tau_sp_I = np.array([
+            self.MC_ROLLRATE_I * self.rollrate_err_accum,
+            self.MC_PITCHRATE_I * self.pitchrate_err_accum,
+            self.MC_YAWRATE_I   * self.yawrate_err_accum
+        ])
+        tau_sp_D = -np.array([
+            self.MC_ROLLRATE_D * omega[0],
+            self.MC_PITCHRATE_D * omega[1],
+            self.MC_YAWRATE_D   * omega[2]
+        ])
+        tau_sp = tau_sp_P + tau_sp_I + tau_sp_D
+        motor_force_cmd = self.CAM_inv @ np.concatenate([ [thrust_sp], tau_sp ])
+        motor_force_cmd = np.clip(motor_force_cmd, 0.0, self.max_thrust/4)
+        self.data.ctrl[:] = motor_force_cmd
 
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
@@ -165,6 +243,8 @@ class TacDroneHoverEnv(gym.Env):
         obs        = self._get_obs()
         reward     = self._compute_reward(action)
         terminated = self._is_terminated()
+        if terminated:
+            reward -= 100.0  # large penalty for crashing/going out of bounds
         self._step_count += 1
         truncated  = self._step_count >= self.max_episode_steps
 
@@ -180,10 +260,12 @@ class TacDroneHoverEnv(gym.Env):
     # ------------------------------------------------------------------ #
     def render(self):
         if self.render_mode == "human":
-            if self._viewer is None:
+            if not self._viewer_launched:
                 import mujoco.viewer as mjv
                 self._viewer = mjv.launch_passive(self.model, self.data)
-            if self._viewer.is_running():
+                self._viewer_launched = True
+
+            if self._viewer is not None and self._viewer.is_running():
                 self._viewer.sync()
 
         elif self.render_mode == "rgb_array":
@@ -196,6 +278,7 @@ class TacDroneHoverEnv(gym.Env):
         if self._viewer is not None:
             self._viewer.close()
             self._viewer = None
+        self._viewer_launched = False
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
