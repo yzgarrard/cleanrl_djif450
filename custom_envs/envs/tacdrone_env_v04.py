@@ -86,6 +86,11 @@ class TacDroneHoverEnvV04(gym.Env):
         self.CAM_inv = np.linalg.inv(self.CAM)
         self.max_i_torque = np.array([0.03, 0.03, 0.01], dtype=np.float32) # anti-windup limits for the integral term of the rate controller
 
+        # Motor stuff
+        self.motor_time_constant = 0.059  # seconds, for first-order motor delay approximation
+        self.alpha = np.exp(-self.dt/self.motor_time_constant)  # assuming dt of 0.01 seconds
+
+
         # --- Spaces ---
         obs_low  = np.full(19, -np.inf, dtype=np.float32)
         obs_high = np.full(19,  np.inf, dtype=np.float32)
@@ -235,9 +240,10 @@ class TacDroneHoverEnvV04(gym.Env):
         tau_sp = tau_sp_P + tau_sp_I + tau_sp_D
         motor_force_cmd = self.CAM_inv @ np.concatenate([ [thrust_sp], tau_sp ])
         motor_force_cmd = np.clip(motor_force_cmd, 0.0, self.max_thrust/4)
-        self.data.ctrl[:] = motor_force_cmd
 
         for _ in range(self.frame_skip):
+            # self.data.ctrl[:] = motor_force_cmd
+            self.data.ctrl[:] = self.alpha*self.data.ctrl[:] + (1-self.alpha)*motor_force_cmd
             mujoco.mj_step(self.model, self.data)
 
         obs        = self._get_obs()
