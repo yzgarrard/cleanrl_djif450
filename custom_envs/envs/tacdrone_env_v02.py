@@ -15,18 +15,18 @@ import mujoco
 _DEFAULT_XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tacdrone.xml")
 
 
-class TacDroneHoverEnv(gym.Env):
+class TacDroneHoverEnvV02(gym.Env):
     """
-    ## Observation Space  (Box, shape=(19,), dtype=float32)
+    ## Observation Space  (Box, shape=(21,), dtype=float32)
     Index | Quantity
     ------|----------------------------------------------------------
-    0-2   | Position  x, y, z  (world frame)
-    3-6   | Quaternion  qw, qx, qy, qz
-    7-9   | Linear velocity  vx, vy, vz  (world frame)
-    10-12 | Angular velocity  wx, wy, wz  (body frame, gyro)
-    13-15 | Linear acceleration ax, ay, az  (body frame, accel)
-    16    | z-error  (target_z - current_z)
-    17-18 | xy displacement from spawn  (dx, dy)
+    0-2   | Position  error ex, ey, ez  (world frame)
+    3-5   | Velocity vx, vy, vz  (world frame)
+    6-8   | Acceleration ax, ay, az  (body frame, accel)
+    9-12  | Quaternion  qw, qx, qy, qz
+    13-15 | Angular velocity  wx, wy, wz  (body frame)
+    16    | Height above the ground (z)
+    17-20 | Previous action 
 
     ## Action Space  (Box, shape=(4,), dtype=float32)
     Normalised motor commands in [-1, 1] (re-scaled to [0, 13.5] N inside step).
@@ -45,19 +45,18 @@ class TacDroneHoverEnv(gym.Env):
         super().__init__()
 
         self.xml_path = xml_path
-        self.target_z = target_z
         self.render_mode = render_mode
         self.max_episode_steps = max_episode_steps
 
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data  = mujoco.MjData(self.model)
 
-        self.frame_skip  = 2
+        self.frame_skip  = 1
         self.max_thrust  = 10
 
         # --- Spaces ---
-        obs_low  = np.full(19, -np.inf, dtype=np.float32)
-        obs_high = np.full(19,  np.inf, dtype=np.float32)
+        obs_low  = np.full(21, -np.inf, dtype=np.float32)
+        obs_high = np.full(21,  np.inf, dtype=np.float32)
         self.observation_space = spaces.Box(obs_low, obs_high, dtype=np.float32)
 
         # Symmetric [-1, 1] → avoids SB3 warning; rescaled in step()
@@ -71,34 +70,39 @@ class TacDroneHoverEnv(gym.Env):
         self.motor_time_constant = 0.059  # seconds, for first-order motor delay approximation
         self.alpha = np.exp(-0.01/self.motor_time_constant)  # assuming dt of 0.01 seconds
 
+        # Desired pose
+        self.target_pos = np.array([0,0,target_z], dtype=np.float32)
+        
+        #
+        self.last_action = np.zeros(4, dtype=np.float32)
+        self.ctrl_cmd = np.zeros(4, dtype=np.float32)
+        
         # --- Reward weights ---
-        self.w_z    = 3.0
-        self.w_xy   = 1.0
-        self.w_vel  = 0.2
-        self.w_ang  = 0.1
-        self.w_tilt = 2.0
-        self.w_act  = 0.05
-        self.alive  = 1.0
+        self.w_pos = 3
+        self.w_vel = 0.2
+        self.w_att = 2
+        self.w_omega = 0.1
+        self.w_act = 0.05
+        self.w_act_baseline = 1.883*9.81/4  # baseline force for hover thrust
+        self.alive  = 2.0
 
         # --- Rendering (only used when render_mode="human" on eval env) ---
         self._viewer   = None
         self._viewer_launched = False
         self._renderer = None
         self._step_count = 0
-        self._init_xy    = np.zeros(2)
 
     # ------------------------------------------------------------------ #
     #  Internals                                                           #
     # ------------------------------------------------------------------ #
     def _get_obs(self) -> np.ndarray:
         pos   = self.data.qpos[:3].copy()
+        pos_err = self.target_pos - pos
         quat  = self.data.qpos[3:7].copy()
         vel   = self.data.qvel[:3].copy()
-        gyro  = self.data.sensor("body_gyro").data.copy()
         accel = self.data.sensor("body_accel").data.copy()
-        z_err = np.array([self.target_z - pos[2]], dtype=np.float32)
-        xy    = pos[:2] - self._init_xy
-        return np.concatenate([pos, quat, vel, gyro, accel, z_err, xy]).astype(np.float32)
+        gyro  = self.data.sensor("body_gyro").data.copy()
+        return np.concatenate([pos_err, vel, accel, quat, gyro, np.array([pos[2]]), self.last_action]).astype(np.float32)
 
     def _tilt_angle(self) -> float:
         rot = np.zeros(9)
@@ -107,31 +111,34 @@ class TacDroneHoverEnv(gym.Env):
         cos_tilt = float(np.clip(body_z[2], -1.0, 1.0))
         return float(np.arccos(cos_tilt))
 
-    def _compute_reward(self, action_normed: np.ndarray) -> float:
+    def _compute_reward(self) -> float:
         pos  = self.data.qpos[:3]
         vel  = self.data.qvel[:3]
         gyro = self.data.sensor("body_gyro").data
-        z_err  = self.target_z - pos[2]
-        # xy_err = float(np.linalg.norm(pos[:2] - self._init_xy))
-        xy_err = float(np.linalg.norm(-pos[:2]))
-        tilt   = self._tilt_angle()
-        return float(
-              self.alive
-            - self.w_z    * z_err**2
-            - self.w_xy   * xy_err**2
-            - self.w_vel  * float(np.dot(vel, vel))
-            - self.w_ang  * float(np.dot(gyro, gyro))
-            - self.w_tilt * tilt**2
-            - self.w_act  * float(np.sum(action_normed**2))
+        
+        rot = np.zeros(9)
+        mujoco.mju_quat2Mat(rot, self.data.qpos[3:7])
+        
+        pos_err = np.linalg.norm(self.target_pos - pos)**2
+        vel_err = np.linalg.norm(vel)**2
+        att_err = 1-self.data.qpos[3]**2
+        omega_err = np.linalg.norm(gyro)**2
+        act_cost = np.linalg.norm(self.ctrl_cmd - self.w_act_baseline)**2
+        return  float(
+              - self.w_pos  * pos_err
+              - self.w_vel  * vel_err
+              - self.w_att  * att_err
+              - self.w_omega * omega_err
+              - self.w_act  * act_cost
+              + self.alive
         )
 
     def _is_terminated(self) -> bool:
         pos  = self.data.qpos[:3]
         tilt = self._tilt_angle()
-        if pos[2] < 0.05:                            return True
-        if abs(self.target_z - pos[2]) > 3.0:        return True
-        if abs(pos[0]) > 5.0 or abs(pos[1]) > 5.0:  return True
-        if tilt > np.deg2rad(60):                     return True
+        pos_xy_err = np.linalg.norm(self.target_pos[0:2] - pos[0:2])
+        if pos_xy_err > 1 or tilt > np.deg2rad(60) or pos[2] < 0.05 or pos[2] > 3.0:
+            return True
         return False
 
     # ------------------------------------------------------------------ #
@@ -144,8 +151,11 @@ class TacDroneHoverEnv(gym.Env):
         rng = self.np_random
         self.data.qpos[0] += rng.uniform(-0.05, 0.05)
         self.data.qpos[1] += rng.uniform(-0.05, 0.05)
-        self.data.qpos[2]  = 0.135 + rng.uniform(0, 0.1)
-
+        self.data.qpos[2]  = 0.135 + rng.uniform(0, 0.01)
+        
+        self.last_action = np.zeros(4, dtype=np.float32)
+        self.ctrl_cmd = np.zeros(4, dtype=np.float32)
+        
         axis  = rng.standard_normal(3)
         axis /= np.linalg.norm(axis) + 1e-8
         angle = rng.uniform(0, np.deg2rad(5))
@@ -156,34 +166,32 @@ class TacDroneHoverEnv(gym.Env):
         self.data.qpos[3:7] = q_out
 
         mujoco.mj_forward(self.model, self.data)
-        self._init_xy    = self.data.qpos[:2].copy()
         self._step_count = 0
         return self._get_obs(), {}
 
     def step(self, action: np.ndarray):
         # Rescale [-1,1] → [0, max_thrust]
-        ctrl_cmd = (np.clip(action, -1.0, 1.0) + 1.0) * 0.5 * self.max_thrust
-        
+        self.ctrl_cmd = (np.clip(action, -1.0, 1.0) + 1.0) * 0.5 * self.max_thrust
+        self.last_action = action.copy()
         # Set the thrust of the motor instantly
         # self.data.ctrl[:] = ctrl_cmd
         
-        # Set the thrust of the motor accounting for motor delay
-        self.data.ctrl[:] = self.alpha*self.data.ctrl[:] + (1-self.alpha)*ctrl_cmd
-        # self.data.ctrl[:] = 0
 
         for _ in range(self.frame_skip):
+            # Set the thrust of the motor accounting for motor delay
+            self.data.ctrl[:] = self.alpha*self.data.ctrl[:] + (1-self.alpha)*self.ctrl_cmd
             mujoco.mj_step(self.model, self.data)
 
+
         obs        = self._get_obs()
-        reward     = self._compute_reward(action)
+        reward = self._compute_reward()
         terminated = self._is_terminated()
+        if terminated: reward -= 100
         self._step_count += 1
         truncated  = self._step_count >= self.max_episode_steps
 
         info = {
             "z":        float(self.data.qpos[2]),
-            "z_err":    float(self.target_z - self.data.qpos[2]),
-            "tilt_deg": float(np.rad2deg(self._tilt_angle())),
         }
         return obs, reward, terminated, truncated, info
 

@@ -15,12 +15,12 @@ import mujoco
 _DEFAULT_XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tacdrone.xml")
 
 
-class TacDroneHoverEnv(gym.Env):
+class TacDroneHoverEnvV03(gym.Env):
     """
     ## Observation Space  (Box, shape=(19,), dtype=float32)
     Index | Quantity
     ------|----------------------------------------------------------
-    0-2   | Position  x, y, z  (world frame)
+    0-2   | Position error  ex, ey, ez  (world frame)
     3-6   | Quaternion  qw, qx, qy, qz
     7-9   | Linear velocity  vx, vy, vz  (world frame)
     10-12 | Angular velocity  wx, wy, wz  (body frame, gyro)
@@ -67,6 +67,8 @@ class TacDroneHoverEnv(gym.Env):
             dtype=np.float32,
         )
         
+        self.des_pos = np.array([0.0, 0.0, self.target_z], dtype=np.float32)
+        
         # Physical constants
         self.motor_time_constant = 0.059  # seconds, for first-order motor delay approximation
         self.alpha = np.exp(-0.01/self.motor_time_constant)  # assuming dt of 0.01 seconds
@@ -111,9 +113,9 @@ class TacDroneHoverEnv(gym.Env):
         pos  = self.data.qpos[:3]
         vel  = self.data.qvel[:3]
         gyro = self.data.sensor("body_gyro").data
-        z_err  = self.target_z - pos[2]
+        z_err  = self.des_pos[2] - pos[2]
         # xy_err = float(np.linalg.norm(pos[:2] - self._init_xy))
-        xy_err = float(np.linalg.norm(-pos[:2]))
+        xy_err = float(np.linalg.norm(self.des_pos[:2] - pos[:2]))
         tilt   = self._tilt_angle()
         return float(
               self.alive
@@ -129,8 +131,8 @@ class TacDroneHoverEnv(gym.Env):
         pos  = self.data.qpos[:3]
         tilt = self._tilt_angle()
         if pos[2] < 0.05:                            return True
-        if abs(self.target_z - pos[2]) > 3.0:        return True
-        if abs(pos[0]) > 5.0 or abs(pos[1]) > 5.0:  return True
+        if abs(self.des_pos[2] - pos[2]) > 3.0:        return True
+        # if abs(pos[0]) > 5.0 or abs(pos[1]) > 5.0:  return True
         if tilt > np.deg2rad(60):                     return True
         return False
 
@@ -167,11 +169,10 @@ class TacDroneHoverEnv(gym.Env):
         # Set the thrust of the motor instantly
         # self.data.ctrl[:] = ctrl_cmd
         
-        # Set the thrust of the motor accounting for motor delay
-        self.data.ctrl[:] = self.alpha*self.data.ctrl[:] + (1-self.alpha)*ctrl_cmd
-        # self.data.ctrl[:] = 0
 
         for _ in range(self.frame_skip):
+            # Set the thrust of the motor accounting for motor delay
+            self.data.ctrl[:] = self.alpha*self.data.ctrl[:] + (1-self.alpha)*ctrl_cmd
             mujoco.mj_step(self.model, self.data)
 
         obs        = self._get_obs()
