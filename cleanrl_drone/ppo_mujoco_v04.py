@@ -79,6 +79,12 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
+    actor_logstd_init: float = 0.0
+    """initial log standard deviation for Gaussian policy"""
+    actor_logstd_min: float = -3.0
+    """minimum clamped actor log standard deviation"""
+    actor_logstd_max: float = 0.5
+    """maximum clamped actor log standard deviation"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -120,8 +126,9 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, actor_logstd_init, actor_logstd_min, actor_logstd_max):
         super().__init__()
+        action_dim = np.prod(envs.single_action_space.shape)
         self.critic = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
@@ -134,16 +141,22 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
+            layer_init(nn.Linear(64, action_dim), std=0.01),
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+        self.actor_logstd = nn.Parameter(torch.full((1, action_dim), actor_logstd_init))
+        self.actor_logstd_min = actor_logstd_min
+        self.actor_logstd_max = actor_logstd_max
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_logstd = torch.clamp(
+            self.actor_logstd,
+            self.actor_logstd_min,
+            self.actor_logstd_max,
+        ).expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
         if action is None:
@@ -188,8 +201,15 @@ if __name__ == "__main__":
         [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+    action_low = torch.as_tensor(envs.single_action_space.low, device=device)
+    action_high = torch.as_tensor(envs.single_action_space.high, device=device)
 
-    agent = Agent(envs).to(device)
+    agent = Agent(
+        envs,
+        args.actor_logstd_init,
+        args.actor_logstd_min,
+        args.actor_logstd_max,
+    ).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -320,9 +340,24 @@ if __name__ == "__main__":
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+        with torch.no_grad():
+            clamped_logstd = torch.clamp(
+                agent.actor_logstd,
+                agent.actor_logstd_min,
+                agent.actor_logstd_max,
+            )
+            action_std = torch.exp(clamped_logstd)
+            raw_action_clip_fraction = ((b_actions < action_low) | (b_actions > action_high)).float().mean()
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("charts/actor_logstd_mean", clamped_logstd.mean().item(), global_step)
+        writer.add_scalar("charts/actor_logstd_min", clamped_logstd.min().item(), global_step)
+        writer.add_scalar("charts/actor_logstd_max", clamped_logstd.max().item(), global_step)
+        writer.add_scalar("charts/action_std_mean", action_std.mean().item(), global_step)
+        writer.add_scalar("charts/action_std_min", action_std.min().item(), global_step)
+        writer.add_scalar("charts/action_std_max", action_std.max().item(), global_step)
+        writer.add_scalar("charts/raw_action_clip_fraction", raw_action_clip_fraction.item(), global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
