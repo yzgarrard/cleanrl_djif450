@@ -85,6 +85,12 @@ class Args:
     """minimum clamped actor log standard deviation"""
     actor_logstd_max: float = 0.5
     """maximum clamped actor log standard deviation"""
+    deterministic_eval_interval: int = 100_000
+    """run deployment-style deterministic evaluation every N training steps; set <= 0 to disable"""
+    deterministic_eval_episodes: int = 5
+    """the number of deterministic evaluation episodes to run each time"""
+    deterministic_eval_seed: int = 10_000
+    """the base seed for deterministic evaluation episodes"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -110,6 +116,14 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
     return thunk
 
 
+def make_deterministic_eval_env(env_id):
+    env = gym.make(env_id)
+    env = gym.wrappers.FlattenObservation(env)
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+    env = gym.wrappers.ClipAction(env)
+    return env
+
+
 def find_normalize_observation_wrapper(env):
     while True:
         if isinstance(env, gym.wrappers.NormalizeObservation):
@@ -119,6 +133,59 @@ def find_normalize_observation_wrapper(env):
         env = env.env
 
 
+def normalize_eval_obs(obs, obs_mean, obs_var, obs_epsilon, device):
+    obs = (obs - obs_mean) / np.sqrt(obs_var + obs_epsilon)
+    obs = np.clip(obs, -10.0, 10.0)
+    return torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+
+
+def run_deterministic_eval(
+    agent,
+    env_id,
+    obs_mean,
+    obs_var,
+    obs_epsilon,
+    action_low,
+    action_high,
+    device,
+    eval_episodes,
+    eval_seed,
+):
+    eval_env = make_deterministic_eval_env(env_id)
+    max_episode_steps = getattr(eval_env.unwrapped, "max_episode_steps", None)
+    episodic_returns = []
+    episodic_lengths = []
+
+    try:
+        for episode_idx in range(eval_episodes):
+            obs, _ = eval_env.reset(seed=eval_seed + episode_idx)
+            terminated = False
+            truncated = False
+            episodic_return = 0.0
+            episodic_length = 0
+
+            while not (terminated or truncated):
+                with torch.no_grad():
+                    normalized_obs = normalize_eval_obs(obs, obs_mean, obs_var, obs_epsilon, device)
+                    action = agent.actor_mean(normalized_obs)
+                    action = torch.clamp(action, action_low, action_high)
+
+                obs, reward, terminated, truncated, _ = eval_env.step(action.squeeze(0).cpu().numpy())
+                episodic_return += float(reward)
+                episodic_length += 1
+
+            episodic_returns.append(episodic_return)
+            episodic_lengths.append(episodic_length)
+    finally:
+        eval_env.close()
+
+    return (
+        np.asarray(episodic_returns, dtype=np.float32),
+        np.asarray(episodic_lengths, dtype=np.float32),
+        max_episode_steps,
+    )
+
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -126,7 +193,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs, actor_logstd_init, actor_logstd_min, actor_logstd_max):
+    def __init__(self, envs, actor_logstd_init=0.0, actor_logstd_min=-3.0, actor_logstd_max=0.5):
         super().__init__()
         action_dim = np.prod(envs.single_action_space.shape)
         self.critic = nn.Sequential(
@@ -222,6 +289,7 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
+    next_deterministic_eval_step = args.deterministic_eval_interval
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
@@ -367,6 +435,46 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        if (
+            args.deterministic_eval_interval > 0
+            and args.deterministic_eval_episodes > 0
+            and global_step >= next_deterministic_eval_step
+        ):
+            normalize_obs_wrapper = find_normalize_observation_wrapper(envs.envs[0])
+            eval_returns, eval_lengths, eval_max_episode_steps = run_deterministic_eval(
+                agent=agent,
+                env_id=args.env_id,
+                obs_mean=normalize_obs_wrapper.obs_rms.mean.copy(),
+                obs_var=normalize_obs_wrapper.obs_rms.var.copy(),
+                obs_epsilon=normalize_obs_wrapper.epsilon,
+                action_low=action_low,
+                action_high=action_high,
+                device=device,
+                eval_episodes=args.deterministic_eval_episodes,
+                eval_seed=args.deterministic_eval_seed + next_deterministic_eval_step,
+            )
+            if eval_max_episode_steps is None:
+                full_length_fraction = np.nan
+            else:
+                full_length_fraction = np.mean(eval_lengths >= eval_max_episode_steps)
+
+            writer.add_scalar("deterministic_eval/episodic_return_mean", eval_returns.mean().item(), global_step)
+            writer.add_scalar("deterministic_eval/episodic_return_min", eval_returns.min().item(), global_step)
+            writer.add_scalar("deterministic_eval/episodic_return_max", eval_returns.max().item(), global_step)
+            writer.add_scalar("deterministic_eval/episodic_length_mean", eval_lengths.mean().item(), global_step)
+            writer.add_scalar("deterministic_eval/full_length_fraction", float(full_length_fraction), global_step)
+            for idx, episodic_return in enumerate(eval_returns):
+                writer.add_scalar("deterministic_eval/episodic_return", episodic_return.item(), global_step + idx)
+            print(
+                "deterministic_eval:"
+                f" global_step={global_step},"
+                f" return_mean={eval_returns.mean().item():.3f},"
+                f" length_mean={eval_lengths.mean().item():.1f},"
+                f" full_length_fraction={float(full_length_fraction):.3f}"
+            )
+            while global_step >= next_deterministic_eval_step:
+                next_deterministic_eval_step += args.deterministic_eval_interval
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
