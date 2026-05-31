@@ -20,16 +20,14 @@ _DEFAULT_XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tacdron
 
 class TacDroneHoverEnvV04(gym.Env):
     """
-    ## Observation Space  (Box, shape=(19,), dtype=float32)
+    ## Observation Space  (Box, shape=(16,), dtype=float32)
     Index | Quantity
     ------|----------------------------------------------------------
-    0-2   | Position  x, y, z  (world frame)
+    0-2   | Position error ex, ey, ez  (world frame)
     3-6   | Quaternion  qw, qx, qy, qz
     7-9   | Linear velocity  vx, vy, vz  (world frame)
     10-12 | Angular velocity  wx, wy, wz  (body frame, gyro)
     13-15 | Linear acceleration ax, ay, az  (body frame, accel)
-    16    | z-error  (target_z - current_z)
-    17-18 | xy displacement from spawn  (dx, dy)
 
     ## Action Space  (Box, shape=(4,), dtype=float32)
     Normalised thrust and angular rates in [-1, 1] (re-scaled to [0, 10.0] N and [rad/s] inside step).
@@ -43,14 +41,12 @@ class TacDroneHoverEnvV04(gym.Env):
     def __init__(
         self,
         xml_path: str = _DEFAULT_XML,
-        target_z: float = 1.0,
         render_mode: str | None = None,
         max_episode_steps: int = 1000,
     ):
         super().__init__()
 
         self.xml_path = xml_path
-        self.target_z = target_z
         self.render_mode = render_mode
         self.max_episode_steps = max_episode_steps
 
@@ -92,8 +88,8 @@ class TacDroneHoverEnvV04(gym.Env):
 
 
         # --- Spaces ---
-        obs_low  = np.full(19, -np.inf, dtype=np.float32)
-        obs_high = np.full(19,  np.inf, dtype=np.float32)
+        obs_low  = np.full(16, -np.inf, dtype=np.float32)
+        obs_high = np.full(16,  np.inf, dtype=np.float32)
         self.observation_space = spaces.Box(obs_low, obs_high, dtype=np.float32)
 
         # Symmetric [-1, 1] → avoids SB3 warning; rescaled in step()
@@ -112,6 +108,9 @@ class TacDroneHoverEnvV04(gym.Env):
         self.w_yaw = 1.0
         self.w_act  = 0.05
         self.alive  = 1.0
+        
+        # Desired pos
+        self.pos_des = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
         # --- Rendering (only used when render_mode="human" on eval env) ---
         self._viewer = None
@@ -129,9 +128,10 @@ class TacDroneHoverEnvV04(gym.Env):
         vel   = self.data.qvel[:3].copy()
         gyro  = self.data.sensor("body_gyro").data.copy()
         accel = self.data.sensor("body_accel").data.copy()
-        z_err = np.array([self.target_z - pos[2]], dtype=np.float32)
-        xy    = pos[:2] - self._init_xy
-        return np.concatenate([pos, quat, vel, gyro, accel, z_err, xy]).astype(np.float32)
+        # z_err = np.array([self.pos_des - pos[2]], dtype=np.float32)
+        # xy_err    = self.pos_des[0:2] - pos[:2]
+        pos_err = (self.pos_des - pos).astype(np.float32)
+        return np.concatenate([pos_err, quat, vel, gyro, accel]).astype(np.float32)
 
     def _tilt_angle(self) -> float:
         rot = np.zeros(9)
@@ -144,8 +144,8 @@ class TacDroneHoverEnvV04(gym.Env):
         pos  = self.data.qpos[:3]
         vel  = self.data.qvel[:3]
         gyro = self.data.sensor("body_gyro").data
-        z_err  = self.target_z - pos[2]
-        xy_err = float(np.linalg.norm(pos[:2] - self._init_xy))
+        z_err  = self.pos_des[2] - pos[2]
+        xy_err = float(np.linalg.norm(self.pos_des[:2] - pos[:2]))
         tilt   = self._tilt_angle()
         quat = self.data.qpos[3:7]
         eul = R.from_quat(quat, scalar_first=True).as_euler("zyx", degrees=False)
@@ -165,7 +165,7 @@ class TacDroneHoverEnvV04(gym.Env):
         pos  = self.data.qpos[:3]
         tilt = self._tilt_angle()
         if pos[2] < 0.05:                            return True
-        if abs(self.target_z - pos[2]) > 3.0:        return True
+        if abs(self.pos_des[2] - pos[2]) > 3.0:        return True
         if abs(pos[0]) > 5.0 or abs(pos[1]) > 5.0:  return True
         if tilt > np.deg2rad(60):                     return True
         return False
@@ -178,13 +178,16 @@ class TacDroneHoverEnvV04(gym.Env):
         mujoco.mj_resetData(self.model, self.data)
 
         rng = self.np_random
-        self.data.qpos[0] += rng.uniform(-0.05, 0.05)
-        self.data.qpos[1] += rng.uniform(-0.05, 0.05)
-        self.data.qpos[2]  = 0.135 + rng.uniform(-0.02, 0.02)
+        self.data.qpos[0] = rng.uniform(-0.5, 0.5)
+        self.data.qpos[1] = rng.uniform(-0.5, 0.5)
+        self.data.qpos[2]  = 0.135 + rng.uniform(0, 1)
         
         self.pitchrate_err_accum = 0.0
         self.rollrate_err_accum  = 0.0
         self.yawrate_err_accum   = 0.0
+        
+        self.pos_des[0:2] = rng.uniform(-0.5, 0.5, size=2)
+        self.pos_des[2] = rng.uniform(0.5, 2.0)
 
         axis  = rng.standard_normal(3)
         axis /= np.linalg.norm(axis) + 1e-8
@@ -256,8 +259,11 @@ class TacDroneHoverEnvV04(gym.Env):
 
         info = {
             "z":        float(self.data.qpos[2]),
-            "z_err":    float(self.target_z - self.data.qpos[2]),
+            "z_err":    float(self.pos_des[2] - self.data.qpos[2]),
             "tilt_deg": float(np.rad2deg(self._tilt_angle())),
+            "x_err": float(self.pos_des[0] - self.data.qpos[0]),
+            "y_err": float(self.pos_des[1] - self.data.qpos[1]),
+            "pos_des": self.pos_des.copy(),
         }
         return obs, reward, terminated, truncated, info
 

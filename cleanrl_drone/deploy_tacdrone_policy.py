@@ -126,10 +126,13 @@ def run_episode(
 
         if terminated or truncated:
             print(
-                f"episode={episode_idx + 1} step={step + 1} "
-                f"return={total_reward:.3f} terminated={terminated} truncated={truncated} "
-                f"z={info.get('z', float('nan')):.3f} "
-                f"tilt_deg={info.get('tilt_deg', float('nan')):.2f}"
+                f"episode={episode_idx + 1} step={step + 1}\n"
+                f"return={total_reward:.3f} terminated={terminated} truncated={truncated}\n"
+                f"z={info.get('z', float('nan')):.3f}\n"
+                f"tilt_deg={info.get('tilt_deg', float('nan')):.2f}\n"
+                f"x_err={info.get('x_err', float('nan')):.3f}\n"
+                f"y_err={info.get('y_err', float('nan')):.3f}\n"
+                f"pos_des={info.get('pos_des', float('nan'))}\n"
             )
             return total_reward, step + 1, False
 
