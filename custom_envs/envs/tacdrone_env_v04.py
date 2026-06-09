@@ -20,7 +20,7 @@ _DEFAULT_XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tacdron
 
 class TacDroneHoverEnvV04(gym.Env):
     """
-    ## Observation Space  (Box, shape=(13,), dtype=float32)
+    ## Observation Space  (Box, shape=(20,), dtype=float32)
     Index | Quantity
     ------|----------------------------------------------------------
     0-2   | Position error ex, ey, ez  (world frame)
@@ -28,6 +28,7 @@ class TacDroneHoverEnvV04(gym.Env):
     7-9   | Linear velocity  vx, vy, vz  (world frame)
     10-12 | Angular velocity  wx, wy, wz  (body frame, gyro)
     13-15 | Linear acceleration ax, ay, az (body frame, accelerometer)
+    16-19 | Previous action
 
     ## Action Space  (Box, shape=(4,), dtype=float32)
     Normalised thrust and angular rates in [-1, 1] (re-scaled to [0, 10.0] N and [rad/s] inside step).
@@ -88,8 +89,8 @@ class TacDroneHoverEnvV04(gym.Env):
 
 
         # --- Spaces ---
-        obs_low  = np.full(16, -np.inf, dtype=np.float32)
-        obs_high = np.full(16,  np.inf, dtype=np.float32)
+        obs_low  = np.full(20, -np.inf, dtype=np.float32)
+        obs_high = np.full(20,  np.inf, dtype=np.float32)
         self.observation_space = spaces.Box(obs_low, obs_high, dtype=np.float32)
 
         # Symmetric [-1, 1] → avoids SB3 warning; rescaled in step()
@@ -98,6 +99,7 @@ class TacDroneHoverEnvV04(gym.Env):
             high =  np.ones(4, dtype=np.float32),
             dtype=np.float32,
         )
+        self.last_action = np.zeros(4, dtype=np.float32)
 
         # --- Reward weights ---
         self.w_z    = 3.0
@@ -135,7 +137,7 @@ class TacDroneHoverEnvV04(gym.Env):
         # z_err = np.array([self.pos_des - pos[2]], dtype=np.float32)
         # xy_err    = self.pos_des[0:2] - pos[:2]
         pos_err = (self.pos_des - pos).astype(np.float32)
-        return np.concatenate([pos_err, quat, vel, gyro, accel]).astype(np.float32)
+        return np.concatenate([pos_err, quat, vel, gyro, accel, self.last_action]).astype(np.float32)
 
     def _tilt_angle(self) -> float:
         rot = np.zeros(9)
@@ -254,7 +256,8 @@ class TacDroneHoverEnvV04(gym.Env):
             # self.data.ctrl[:] = motor_force_cmd
             self.data.ctrl[:] = self.alpha*self.data.ctrl[:] + (1-self.alpha)*motor_force_cmd
             mujoco.mj_step(self.model, self.data)
-
+            
+        self.last_action = action.copy()
         obs        = self._get_obs()
         reward     = self._compute_reward(action)
         terminated = self._is_terminated()
