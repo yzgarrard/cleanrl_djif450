@@ -109,7 +109,7 @@ class TacDroneHoverEnvV04(gym.Env):
         self.w_tilt = 2.0
         self.w_yaw = 1.0
         self.w_act  = 0.05
-        self.alive  = 1.0
+        self.alive  = 0.0
         
         # Desired pos
         self.pos_des = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -262,7 +262,7 @@ class TacDroneHoverEnvV04(gym.Env):
         reward     = self._compute_reward(action)
         terminated = self._is_terminated()
         if terminated:
-            reward -= 100.0  # large penalty for crashing/going out of bounds
+            reward -= 200.0  # large penalty for crashing/going out of bounds
         self._step_count += 1
         truncated  = self._step_count >= self.max_episode_steps
 
