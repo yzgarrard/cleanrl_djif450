@@ -20,14 +20,14 @@ _DEFAULT_XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tacdron
 
 class TacDroneHoverEnvV04(gym.Env):
     """
-    ## Observation Space  (Box, shape=(16,), dtype=float32)
+    ## Observation Space  (Box, shape=(13,), dtype=float32)
     Index | Quantity
     ------|----------------------------------------------------------
     0-2   | Position error ex, ey, ez  (world frame)
     3-6   | Quaternion  qw, qx, qy, qz
     7-9   | Linear velocity  vx, vy, vz  (world frame)
     10-12 | Angular velocity  wx, wy, wz  (body frame, gyro)
-    13-15 | Linear acceleration ax, ay, az  (body frame, accel)
+    13-15 | Linear acceleration ax, ay, az (body frame, accelerometer)
 
     ## Action Space  (Box, shape=(4,), dtype=float32)
     Normalised thrust and angular rates in [-1, 1] (re-scaled to [0, 10.0] N and [rad/s] inside step).
@@ -112,6 +112,9 @@ class TacDroneHoverEnvV04(gym.Env):
         # Desired pos
         self.pos_des = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
+        # Last action
+        self.last_action = np.zeros(4, dtype=np.float32)
+
         # --- Rendering (only used when render_mode="human" on eval env) ---
         self._viewer = None
         self._viewer_launched = False
@@ -123,11 +126,12 @@ class TacDroneHoverEnvV04(gym.Env):
     #  Internals                                                           #
     # ------------------------------------------------------------------ #
     def _get_obs(self) -> np.ndarray:
-        pos   = self.data.qpos[:3].copy()
-        quat  = self.data.qpos[3:7].copy()
-        vel   = self.data.qvel[:3].copy()
-        gyro  = self.data.sensor("body_gyro").data.copy()
-        accel = self.data.sensor("body_accel").data.copy()
+        rng = self.np_random
+        pos   = self.data.qpos[:3].copy() + rng.normal(0,0.0005, size=3)
+        quat  = self.data.qpos[3:7].copy()  # Not sure how to add noise here
+        vel   = self.data.qvel[:3].copy() + rng.normal(0,0.1, size=3) # Using https://docs.px4.io/main/en/advanced_config/parameter_reference#EKF2_EVV_NOISE
+        gyro  = self.data.sensor("body_gyro").data.copy() + rng.normal(0,0.015, size=3) # Using https://docs.px4.io/main/en/advanced_config/parameter_reference#EKF2_GYR_NOISE
+        accel = self.data.sensor("body_accel").data.copy() + rng.normal(0,0.35, size=3) # Using https://docs.px4.io/main/en/advanced_config/parameter_reference#EKF2_ACC_NOISE
         # z_err = np.array([self.pos_des - pos[2]], dtype=np.float32)
         # xy_err    = self.pos_des[0:2] - pos[:2]
         pos_err = (self.pos_des - pos).astype(np.float32)
@@ -188,6 +192,8 @@ class TacDroneHoverEnvV04(gym.Env):
         
         self.pos_des[0:2] = rng.uniform(-0.5, 0.5, size=2)
         self.pos_des[2] = rng.uniform(0.5, 2.0)
+        
+        self.last_action = np.zeros(4, dtype=np.float32)
 
         axis  = rng.standard_normal(3)
         axis /= np.linalg.norm(axis) + 1e-8

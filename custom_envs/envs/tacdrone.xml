@@ -1,6 +1,7 @@
 <mujoco model="TacDrone">
 
-    <option timestep="0.01" gravity="0 0 -9.81" />
+    <option timestep="0.01" gravity="0 0 -9.81" integrator="RK4">
+    </option>
 
     <statistic center="0 0 1" extent="8"/>
 

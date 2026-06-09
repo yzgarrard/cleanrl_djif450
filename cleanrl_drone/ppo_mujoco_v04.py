@@ -17,8 +17,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_drone.deploy_policy import DronePolicy
 
-# This script is specifically for dji_f450.py.
-
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -83,7 +81,7 @@ class Args:
     """initial log standard deviation for Gaussian policy"""
     actor_logstd_min: float = -3.0
     """minimum clamped actor log standard deviation"""
-    actor_logstd_max: float = 0.5
+    actor_logstd_max: float = 3
     """maximum clamped actor log standard deviation"""
     deterministic_eval_interval: int = 100_000
     """run deployment-style deterministic evaluation every N training steps; set <= 0 to disable"""
