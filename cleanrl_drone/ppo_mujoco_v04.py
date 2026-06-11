@@ -89,6 +89,10 @@ class Args:
     """the number of deterministic evaluation episodes to run each time"""
     deterministic_eval_seed: int = 10_000
     """the base seed for deterministic evaluation episodes"""
+    final_deterministic_eval_episodes: int = 10
+    """the number of deployment-style deterministic evaluation episodes to run after training"""
+    final_deterministic_eval_seed: int = 20_000
+    """the base seed for final deterministic evaluation episodes"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -182,6 +186,33 @@ def run_deterministic_eval(
         np.asarray(episodic_lengths, dtype=np.float32),
         max_episode_steps,
     )
+
+
+def log_deterministic_eval(
+    writer,
+    prefix,
+    eval_returns,
+    eval_lengths,
+    eval_max_episode_steps,
+    global_step,
+    log_episode_lengths=False,
+):
+    if eval_max_episode_steps is None:
+        full_length_fraction = np.nan
+    else:
+        full_length_fraction = np.mean(eval_lengths >= eval_max_episode_steps)
+
+    writer.add_scalar(f"{prefix}/episodic_return_mean", eval_returns.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/episodic_return_min", eval_returns.min().item(), global_step)
+    writer.add_scalar(f"{prefix}/episodic_return_max", eval_returns.max().item(), global_step)
+    writer.add_scalar(f"{prefix}/episodic_length_mean", eval_lengths.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/full_length_fraction", float(full_length_fraction), global_step)
+    for idx, (episodic_return, episodic_length) in enumerate(zip(eval_returns, eval_lengths)):
+        writer.add_scalar(f"{prefix}/episodic_return", episodic_return.item(), global_step + idx)
+        if log_episode_lengths:
+            writer.add_scalar(f"{prefix}/episodic_length", episodic_length.item(), global_step + idx)
+
+    return full_length_fraction
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -452,18 +483,14 @@ if __name__ == "__main__":
                 eval_episodes=args.deterministic_eval_episodes,
                 eval_seed=args.deterministic_eval_seed + next_deterministic_eval_step,
             )
-            if eval_max_episode_steps is None:
-                full_length_fraction = np.nan
-            else:
-                full_length_fraction = np.mean(eval_lengths >= eval_max_episode_steps)
-
-            writer.add_scalar("deterministic_eval/episodic_return_mean", eval_returns.mean().item(), global_step)
-            writer.add_scalar("deterministic_eval/episodic_return_min", eval_returns.min().item(), global_step)
-            writer.add_scalar("deterministic_eval/episodic_return_max", eval_returns.max().item(), global_step)
-            writer.add_scalar("deterministic_eval/episodic_length_mean", eval_lengths.mean().item(), global_step)
-            writer.add_scalar("deterministic_eval/full_length_fraction", float(full_length_fraction), global_step)
-            for idx, episodic_return in enumerate(eval_returns):
-                writer.add_scalar("deterministic_eval/episodic_return", episodic_return.item(), global_step + idx)
+            full_length_fraction = log_deterministic_eval(
+                writer,
+                "deterministic_eval",
+                eval_returns,
+                eval_lengths,
+                eval_max_episode_steps,
+                global_step,
+            )
             print(
                 "deterministic_eval:"
                 f" global_step={global_step},"
@@ -473,6 +500,41 @@ if __name__ == "__main__":
             )
             while global_step >= next_deterministic_eval_step:
                 next_deterministic_eval_step += args.deterministic_eval_interval
+
+    if args.upload_model and args.final_deterministic_eval_episodes <= 0:
+        raise ValueError("--upload-model requires --final-deterministic-eval-episodes > 0")
+
+    final_eval_returns = None
+    if args.final_deterministic_eval_episodes > 0:
+        normalize_obs_wrapper = find_normalize_observation_wrapper(envs.envs[0])
+        final_eval_returns, final_eval_lengths, final_eval_max_episode_steps = run_deterministic_eval(
+            agent=agent,
+            env_id=args.env_id,
+            obs_mean=normalize_obs_wrapper.obs_rms.mean.copy(),
+            obs_var=normalize_obs_wrapper.obs_rms.var.copy(),
+            obs_epsilon=normalize_obs_wrapper.epsilon,
+            action_low=action_low,
+            action_high=action_high,
+            device=device,
+            eval_episodes=args.final_deterministic_eval_episodes,
+            eval_seed=args.final_deterministic_eval_seed,
+        )
+        final_full_length_fraction = log_deterministic_eval(
+            writer,
+            "final_deterministic_eval",
+            final_eval_returns,
+            final_eval_lengths,
+            final_eval_max_episode_steps,
+            global_step,
+            log_episode_lengths=True,
+        )
+        print(
+            "final_deterministic_eval:"
+            f" global_step={global_step},"
+            f" return_mean={final_eval_returns.mean().item():.3f},"
+            f" length_mean={final_eval_lengths.mean().item():.1f},"
+            f" full_length_fraction={float(final_full_length_fraction):.3f}"
+        )
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
@@ -493,27 +555,12 @@ if __name__ == "__main__":
         torch.save(deploy_agent, deploy_path)
         print(f"deployment policy saved to {deploy_path}")
 
-        from cleanrl_utils.evals.ppo_eval import evaluate
-
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=Agent,
-            device=device,
-            gamma=args.gamma,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
-
         if args.upload_model:
             from cleanrl_utils.huggingface import push_to_hub
 
             repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
+            push_to_hub(args, final_eval_returns.tolist(), repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     envs.close()
     writer.close()

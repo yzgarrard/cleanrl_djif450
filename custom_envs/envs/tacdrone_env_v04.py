@@ -109,6 +109,7 @@ class TacDroneHoverEnvV04(gym.Env):
         self.w_tilt = 2.0
         self.w_yaw = 1.0
         self.w_act  = 0.05
+        self.w_act_delta = 0.1
         self.alive  = 0.0
         
         # Desired pos
@@ -156,6 +157,7 @@ class TacDroneHoverEnvV04(gym.Env):
         quat = self.data.qpos[3:7]
         eul = R.from_quat(quat, scalar_first=True).as_euler("zyx", degrees=False)
         yaw = eul[0]
+        action_delta = action_normed - self.last_action
         return float(
               self.alive
             - self.w_z    * z_err**2
@@ -164,7 +166,8 @@ class TacDroneHoverEnvV04(gym.Env):
             - self.w_ang  * float(np.dot(gyro, gyro))
             - self.w_tilt * tilt**2
             - self.w_yaw  * yaw**2
-            - self.w_act  * float(np.sum(action_normed**2))
+            # - self.w_act  * float(np.sum(action_normed**2))
+            - self.w_act_delta * float(np.sum(action_delta**2))
         )
 
     def _is_terminated(self) -> bool:
@@ -257,7 +260,6 @@ class TacDroneHoverEnvV04(gym.Env):
             self.data.ctrl[:] = self.alpha*self.data.ctrl[:] + (1-self.alpha)*motor_force_cmd
             mujoco.mj_step(self.model, self.data)
             
-        self.last_action = action.copy()
         obs        = self._get_obs()
         reward     = self._compute_reward(action)
         terminated = self._is_terminated()
@@ -265,6 +267,7 @@ class TacDroneHoverEnvV04(gym.Env):
             reward -= 200.0  # large penalty for crashing/going out of bounds
         self._step_count += 1
         truncated  = self._step_count >= self.max_episode_steps
+        self.last_action = action.copy()
 
         info = {
             "z":        float(self.data.qpos[2]),
