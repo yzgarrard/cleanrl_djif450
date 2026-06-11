@@ -215,6 +215,45 @@ def log_deterministic_eval(
     return full_length_fraction
 
 
+REWARD_TERM_NAMES = (
+    "alive",
+    "z",
+    "xy",
+    "vel",
+    "ang",
+    "tilt",
+    "yaw",
+    "act_delta",
+    "termination",
+    "total",
+)
+
+
+def accumulate_reward_terms(infos, reward_term_sums):
+    reward_term_count = 0
+
+    def add_terms(reward_terms):
+        if not reward_terms:
+            return 0
+        for name in REWARD_TERM_NAMES:
+            reward_term_sums[name] += float(reward_terms.get(name, 0.0))
+        return 1
+
+    if "reward_terms" in infos:
+        reward_terms_batch = infos["reward_terms"]
+        reward_terms_mask = infos.get("_reward_terms", np.ones(len(reward_terms_batch), dtype=bool))
+        for reward_terms, has_reward_terms in zip(reward_terms_batch, reward_terms_mask):
+            if has_reward_terms:
+                reward_term_count += add_terms(reward_terms)
+
+    if "final_info" in infos:
+        for info in infos["final_info"]:
+            if info and "reward_terms" in info:
+                reward_term_count += add_terms(info["reward_terms"])
+
+    return reward_term_count
+
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -330,6 +369,8 @@ if __name__ == "__main__":
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
+        reward_term_sums = {name: 0.0 for name in REWARD_TERM_NAMES}
+        reward_term_count = 0
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -345,6 +386,7 @@ if __name__ == "__main__":
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            reward_term_count += accumulate_reward_terms(infos, reward_term_sums)
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
@@ -462,6 +504,9 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        if reward_term_count > 0:
+            for name in REWARD_TERM_NAMES:
+                writer.add_scalar(f"reward_terms/{name}_mean", reward_term_sums[name] / reward_term_count, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 

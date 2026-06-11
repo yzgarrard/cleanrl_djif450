@@ -147,7 +147,7 @@ class TacDroneHoverEnvV04(gym.Env):
         cos_tilt = float(np.clip(body_z[2], -1.0, 1.0))
         return float(np.arccos(cos_tilt))
 
-    def _compute_reward(self, action_normed: np.ndarray) -> float:
+    def _compute_reward(self, action_normed: np.ndarray) -> tuple[float, dict[str, float]]:
         pos  = self.data.qpos[:3]
         vel  = self.data.qvel[:3]
         gyro = self.data.sensor("body_gyro").data
@@ -158,17 +158,20 @@ class TacDroneHoverEnvV04(gym.Env):
         eul = R.from_quat(quat, scalar_first=True).as_euler("zyx", degrees=False)
         yaw = eul[0]
         action_delta = action_normed - self.last_action
-        return float(
-              self.alive
-            - self.w_z    * z_err**2
-            - self.w_xy   * xy_err**2
-            - self.w_vel  * float(np.dot(vel, vel))
-            - self.w_ang  * float(np.dot(gyro, gyro))
-            - self.w_tilt * tilt**2
-            - self.w_yaw  * yaw**2
-            # - self.w_act  * float(np.sum(action_normed**2))
-            - self.w_act_delta * float(np.sum(action_delta**2))
-        )
+        reward_terms = {
+            "alive": float(self.alive),
+            "z": float(-self.w_z * z_err**2),
+            "xy": float(-self.w_xy * xy_err**2),
+            "vel": float(-self.w_vel * float(np.dot(vel, vel))),
+            "ang": float(-self.w_ang * float(np.dot(gyro, gyro))),
+            "tilt": float(-self.w_tilt * tilt**2),
+            "yaw": float(-self.w_yaw * yaw**2),
+            # "act": float(-self.w_act * float(np.sum(action_normed**2))),
+            "act_delta": float(-self.w_act_delta * float(np.sum(action_delta**2))),
+            "termination": 0.0,
+        }
+        reward_terms["total"] = float(sum(reward_terms.values()))
+        return reward_terms["total"], reward_terms
 
     def _is_terminated(self) -> bool:
         pos  = self.data.qpos[:3]
@@ -261,10 +264,12 @@ class TacDroneHoverEnvV04(gym.Env):
             mujoco.mj_step(self.model, self.data)
             
         obs        = self._get_obs()
-        reward     = self._compute_reward(action)
+        reward, reward_terms = self._compute_reward(action)
         terminated = self._is_terminated()
         if terminated:
-            reward -= 200.0  # large penalty for crashing/going out of bounds
+            reward_terms["termination"] = -200.0  # large penalty for crashing/going out of bounds
+            reward = float(reward + reward_terms["termination"])
+            reward_terms["total"] = reward
         self._step_count += 1
         truncated  = self._step_count >= self.max_episode_steps
         self.last_action = action.copy()
@@ -276,6 +281,7 @@ class TacDroneHoverEnvV04(gym.Env):
             "x_err": float(self.pos_des[0] - self.data.qpos[0]),
             "y_err": float(self.pos_des[1] - self.data.qpos[1]),
             "pos_des": self.pos_des.copy(),
+            "reward_terms": reward_terms,
         }
         return obs, reward, terminated, truncated, info
 
