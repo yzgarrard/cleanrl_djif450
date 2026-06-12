@@ -160,7 +160,7 @@ class TacDroneHoverEnvV04(gym.Env):
         action_delta = action_normed - self.last_action
         reward_terms = {
             "alive": float(self.alive),
-            "z": float(-self.w_z * z_err**2),
+            "z": float(-self.w_z * np.linalg.norm(z_err) + self.w_z*np.exp(-10*np.linalg.norm(z_err))),
             "xy": float(-self.w_xy * xy_err**2),
             "vel": float(-self.w_vel * float(np.dot(vel, vel))),
             "ang": float(-self.w_ang * float(np.dot(gyro, gyro))),
