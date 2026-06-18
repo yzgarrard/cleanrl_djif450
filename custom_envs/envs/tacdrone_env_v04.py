@@ -104,6 +104,7 @@ class TacDroneHoverEnvV04(gym.Env):
         # --- Reward weights ---
         self.w_z    = 3.0
         self.w_xy   = 1.0
+        self.w_pos_err = 3.0
         self.w_vel  = 0.2
         self.w_ang  = 0.1
         self.w_tilt = 2.0
@@ -149,6 +150,7 @@ class TacDroneHoverEnvV04(gym.Env):
 
     def _compute_reward(self, action_normed: np.ndarray) -> tuple[float, dict[str, float]]:
         pos  = self.data.qpos[:3]
+        pos_err = (self.pos_des - pos).astype(np.float32)
         vel  = self.data.qvel[:3]
         gyro = self.data.sensor("body_gyro").data
         z_err  = self.pos_des[2] - pos[2]
@@ -160,7 +162,7 @@ class TacDroneHoverEnvV04(gym.Env):
         action_delta = action_normed - self.last_action
         reward_terms = {
             "alive": float(self.alive),
-            "z": float(-self.w_z * np.linalg.norm(z_err) + self.w_z*np.exp(-10*np.linalg.norm(z_err))),
+            "z": float(-self.w_z * z_err**2),
             "xy": float(-self.w_xy * xy_err**2),
             "vel": float(-self.w_vel * float(np.dot(vel, vel))),
             "ang": float(-self.w_ang * float(np.dot(gyro, gyro))),

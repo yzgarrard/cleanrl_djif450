@@ -219,6 +219,7 @@ REWARD_TERM_NAMES = (
     "alive",
     "z",
     "xy",
+    "pos_err",
     "vel",
     "ang",
     "tilt",
