@@ -2,6 +2,7 @@
 import os
 import random
 import time
+from collections import Counter
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -55,7 +56,7 @@ class Args:
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
-    q_lr: float = 1e-3
+    q_lr: float = 3e-4
     """the learning rate of the Q network network optimizer"""
     policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
@@ -65,16 +66,18 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
-    deterministic_eval_interval: int = 100_000
+    deterministic_eval_interval: int = 50_000
     """run deployment-style deterministic evaluation every N training steps; set <= 0 to disable"""
-    deterministic_eval_episodes: int = 5
+    deterministic_eval_episodes: int = 20
     """the number of deterministic evaluation episodes to run each time"""
     deterministic_eval_seed: int = 10_000
     """the base seed for deterministic evaluation episodes"""
-    final_deterministic_eval_episodes: int = 10
+    final_deterministic_eval_episodes: int = 20
     """the number of deployment-style deterministic evaluation episodes to run after training"""
     final_deterministic_eval_seed: int = 20_000
     """the base seed for final deterministic evaluation episodes"""
+    deterministic_eval_settling_seconds: float = 5.0
+    """exclude this initial duration from deterministic tracking metrics"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -172,11 +175,48 @@ class Actor(nn.Module):
         return torch.tanh(mean) * self.action_scale + self.action_bias
 
 
-def run_deterministic_eval(actor, env_id, device, eval_episodes, eval_seed):
+ACTION_NAMES = ("thrust", "roll_rate", "pitch_rate", "yaw_rate")
+TERMINATION_REASONS = (
+    "ground_contact",
+    "altitude_error",
+    "xy_bounds",
+    "excessive_tilt",
+    "time_limit",
+    "unknown",
+)
+
+
+def attitude_error_from_identity(quat):
+    quat = np.asarray(quat, dtype=np.float64)
+    quat /= np.linalg.norm(quat) + 1e-12
+    return float(2.0 * np.arccos(np.clip(np.abs(quat[0]), 0.0, 1.0)))
+
+
+def run_deterministic_eval(
+    actor,
+    env_id,
+    device,
+    eval_episodes,
+    eval_seed,
+    settling_seconds=5.0,
+):
     eval_env = make_deterministic_eval_env(env_id)
     max_episode_steps = getattr(eval_env.unwrapped, "max_episode_steps", None)
+    settling_steps = int(np.ceil(settling_seconds / eval_env.unwrapped.dt))
     episodic_returns = []
     episodic_lengths = []
+    termination_counts = Counter()
+    metric_sums = {
+        "position_error_squared": 0.0,
+        "horizontal_error_squared": 0.0,
+        "vertical_error_squared": 0.0,
+        "velocity_squared": 0.0,
+        "attitude_error_squared": 0.0,
+        "action_delta_squared": 0.0,
+    }
+    action_saturation_counts = np.zeros(len(ACTION_NAMES), dtype=np.float64)
+    max_position_error = 0.0
+    metric_sample_count = 0
 
     try:
         for episode_idx in range(eval_episodes):
@@ -185,27 +225,99 @@ def run_deterministic_eval(actor, env_id, device, eval_episodes, eval_seed):
             truncated = False
             episodic_return = 0.0
             episodic_length = 0
+            previous_action = np.zeros(len(ACTION_NAMES), dtype=np.float32)
+            final_info = {}
 
             while not (terminated or truncated):
                 with torch.no_grad():
                     obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     action = actor.get_deterministic_action(obs_tensor)
 
-                obs, reward, terminated, truncated, _ = eval_env.step(
-                    action.squeeze(0).cpu().numpy()
-                )
+                action_np = action.squeeze(0).cpu().numpy()
+                obs, reward, terminated, truncated, final_info = eval_env.step(action_np)
                 episodic_return += float(reward)
                 episodic_length += 1
 
+                if episodic_length > settling_steps:
+                    unwrapped = eval_env.unwrapped
+                    position_error_vector = unwrapped.data.qpos[:3] - unwrapped.pos_des
+                    position_error = float(np.linalg.norm(position_error_vector))
+                    horizontal_error = float(np.linalg.norm(position_error_vector[:2]))
+                    vertical_error = float(abs(position_error_vector[2]))
+                    velocity = float(np.linalg.norm(unwrapped.data.qvel[:3]))
+                    attitude_error = attitude_error_from_identity(unwrapped.data.qpos[3:7])
+                    action_delta = float(np.linalg.norm(action_np - previous_action))
+
+                    metric_sums["position_error_squared"] += position_error**2
+                    metric_sums["horizontal_error_squared"] += horizontal_error**2
+                    metric_sums["vertical_error_squared"] += vertical_error**2
+                    metric_sums["velocity_squared"] += velocity**2
+                    metric_sums["attitude_error_squared"] += attitude_error**2
+                    metric_sums["action_delta_squared"] += action_delta**2
+                    action_saturation_counts += np.abs(action_np) >= 0.95
+                    max_position_error = max(max_position_error, position_error)
+                    metric_sample_count += 1
+
+                previous_action = action_np.copy()
+
             episodic_returns.append(episodic_return)
             episodic_lengths.append(episodic_length)
+            termination_reason = final_info.get("termination_reason")
+            if termination_reason is None:
+                termination_reason = "time_limit" if truncated else "unknown"
+            termination_counts[termination_reason] += 1
     finally:
         eval_env.close()
+
+    if metric_sample_count:
+        eval_metrics = {
+            "position_error_rms": np.sqrt(
+                metric_sums["position_error_squared"] / metric_sample_count
+            ),
+            "position_error_max": max_position_error,
+            "horizontal_error_rms": np.sqrt(
+                metric_sums["horizontal_error_squared"] / metric_sample_count
+            ),
+            "vertical_error_rms": np.sqrt(
+                metric_sums["vertical_error_squared"] / metric_sample_count
+            ),
+            "velocity_rms": np.sqrt(
+                metric_sums["velocity_squared"] / metric_sample_count
+            ),
+            "attitude_error_rms_deg": np.rad2deg(
+                np.sqrt(metric_sums["attitude_error_squared"] / metric_sample_count)
+            ),
+            "action_delta_rms": np.sqrt(
+                metric_sums["action_delta_squared"] / metric_sample_count
+            ),
+        }
+        for idx, action_name in enumerate(ACTION_NAMES):
+            eval_metrics[f"{action_name}_saturation_fraction"] = (
+                action_saturation_counts[idx] / metric_sample_count
+            )
+    else:
+        eval_metrics = {
+            "position_error_rms": np.nan,
+            "position_error_max": np.nan,
+            "horizontal_error_rms": np.nan,
+            "vertical_error_rms": np.nan,
+            "velocity_rms": np.nan,
+            "attitude_error_rms_deg": np.nan,
+            "action_delta_rms": np.nan,
+        }
+        for action_name in ACTION_NAMES:
+            eval_metrics[f"{action_name}_saturation_fraction"] = np.nan
+    eval_metrics["tracking_sample_count"] = metric_sample_count
+    for reason in TERMINATION_REASONS:
+        eval_metrics[f"termination/{reason}_fraction"] = (
+            termination_counts[reason] / eval_episodes
+        )
 
     return (
         np.asarray(episodic_returns, dtype=np.float32),
         np.asarray(episodic_lengths, dtype=np.float32),
         max_episode_steps,
+        eval_metrics,
     )
 
 
@@ -215,6 +327,7 @@ def log_deterministic_eval(
     eval_returns,
     eval_lengths,
     eval_max_episode_steps,
+    eval_metrics,
     global_step,
     log_episode_lengths=False,
 ):
@@ -228,6 +341,8 @@ def log_deterministic_eval(
     writer.add_scalar(f"{prefix}/episodic_return_max", eval_returns.max().item(), global_step)
     writer.add_scalar(f"{prefix}/episodic_length_mean", eval_lengths.mean().item(), global_step)
     writer.add_scalar(f"{prefix}/full_length_fraction", float(full_length_fraction), global_step)
+    for name, value in eval_metrics.items():
+        writer.add_scalar(f"{prefix}/{name}", value, global_step)
     for idx, (episodic_return, episodic_length) in enumerate(zip(eval_returns, eval_lengths)):
         writer.add_scalar(f"{prefix}/episodic_return", episodic_return.item(), global_step + idx)
         if log_episode_lengths:
@@ -244,6 +359,7 @@ REWARD_TERM_NAMES = (
     "ang",
     "tilt",
     "yaw",
+    "act",
     "act_delta",
     "termination",
     "total",
@@ -293,7 +409,7 @@ def get_actor_statistics(actor, observations):
         if cuda_rng_states is not None:
             torch.cuda.set_rng_state_all(cuda_rng_states)
 
-    return {
+    statistics = {
         "actor_logstd_mean": log_std.mean().item(),
         "actor_logstd_min": log_std.min().item(),
         "actor_logstd_max": log_std.max().item(),
@@ -310,12 +426,57 @@ def get_actor_statistics(actor, observations):
             deterministic_action_normalized.abs() >= 0.95
         ).float().mean().item(),
     }
+    for idx, action_name in enumerate(ACTION_NAMES):
+        statistics[f"sampled_{action_name}_abs_mean"] = (
+            sampled_action_normalized[:, idx].abs().mean().item()
+        )
+        statistics[f"sampled_{action_name}_saturation_fraction"] = (
+            sampled_action_normalized[:, idx].abs() >= 0.95
+        ).float().mean().item()
+        statistics[f"deterministic_{action_name}_abs_mean"] = (
+            deterministic_action_normalized[:, idx].abs().mean().item()
+        )
+        statistics[f"deterministic_{action_name}_saturation_fraction"] = (
+            deterministic_action_normalized[:, idx].abs() >= 0.95
+        ).float().mean().item()
+    return statistics
+
+
+def maybe_save_best_actor(
+    actor,
+    run_dir,
+    global_step,
+    full_length_fraction,
+    eval_metrics,
+    best_position_error_rms,
+):
+    position_error_rms = eval_metrics["position_error_rms"]
+    if (
+        full_length_fraction < 1.0
+        or not np.isfinite(position_error_rms)
+        or position_error_rms >= best_position_error_rms
+    ):
+        return best_position_error_rms, None
+
+    checkpoint_path = os.path.join(run_dir, "best_actor.cleanrl_model")
+    torch.save(
+        {
+            "actor_state_dict": actor.state_dict(),
+            "global_step": global_step,
+            "full_length_fraction": float(full_length_fraction),
+            "position_error_rms": float(position_error_rms),
+            "eval_metrics": eval_metrics,
+        },
+        checkpoint_path,
+    )
+    return float(position_error_rms), checkpoint_path
 
 
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_dir = f"runs/{run_name}"
     if args.track:
         import wandb
 
@@ -328,7 +489,7 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    writer = SummaryWriter(run_dir)
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -382,6 +543,7 @@ if __name__ == "__main__":
     next_deterministic_eval_step = args.deterministic_eval_interval
     reward_term_sums = {name: 0.0 for name in REWARD_TERM_NAMES}
     reward_term_count = 0
+    best_position_error_rms = np.inf
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
@@ -503,12 +665,18 @@ if __name__ == "__main__":
             and args.deterministic_eval_episodes > 0
             and completed_steps >= next_deterministic_eval_step
         ):
-            eval_returns, eval_lengths, eval_max_episode_steps = run_deterministic_eval(
+            (
+                eval_returns,
+                eval_lengths,
+                eval_max_episode_steps,
+                eval_metrics,
+            ) = run_deterministic_eval(
                 actor=actor,
                 env_id=args.env_id,
                 device=device,
                 eval_episodes=args.deterministic_eval_episodes,
-                eval_seed=args.deterministic_eval_seed + next_deterministic_eval_step,
+                eval_seed=args.deterministic_eval_seed,
+                settling_seconds=args.deterministic_eval_settling_seconds,
             )
             full_length_fraction = log_deterministic_eval(
                 writer,
@@ -516,25 +684,48 @@ if __name__ == "__main__":
                 eval_returns,
                 eval_lengths,
                 eval_max_episode_steps,
+                eval_metrics,
                 completed_steps,
             )
+            best_position_error_rms, checkpoint_path = maybe_save_best_actor(
+                actor=actor,
+                run_dir=run_dir,
+                global_step=completed_steps,
+                full_length_fraction=full_length_fraction,
+                eval_metrics=eval_metrics,
+                best_position_error_rms=best_position_error_rms,
+            )
+            if checkpoint_path is not None:
+                writer.add_scalar(
+                    "deterministic_eval/best_position_error_rms",
+                    best_position_error_rms,
+                    completed_steps,
+                )
+                print(f"best actor saved to {checkpoint_path}")
             print(
                 "deterministic_eval:"
                 f" global_step={completed_steps},"
                 f" return_mean={eval_returns.mean().item():.3f},"
                 f" length_mean={eval_lengths.mean().item():.1f},"
-                f" full_length_fraction={float(full_length_fraction):.3f}"
+                f" full_length_fraction={float(full_length_fraction):.3f},"
+                f" position_error_rms={eval_metrics['position_error_rms']:.4f}"
             )
             while completed_steps >= next_deterministic_eval_step:
                 next_deterministic_eval_step += args.deterministic_eval_interval
 
     if args.final_deterministic_eval_episodes > 0:
-        final_eval_returns, final_eval_lengths, final_eval_max_episode_steps = run_deterministic_eval(
+        (
+            final_eval_returns,
+            final_eval_lengths,
+            final_eval_max_episode_steps,
+            final_eval_metrics,
+        ) = run_deterministic_eval(
             actor=actor,
             env_id=args.env_id,
             device=device,
             eval_episodes=args.final_deterministic_eval_episodes,
             eval_seed=args.final_deterministic_eval_seed,
+            settling_seconds=args.deterministic_eval_settling_seconds,
         )
         final_full_length_fraction = log_deterministic_eval(
             writer,
@@ -542,6 +733,7 @@ if __name__ == "__main__":
             final_eval_returns,
             final_eval_lengths,
             final_eval_max_episode_steps,
+            final_eval_metrics,
             args.total_timesteps,
             log_episode_lengths=True,
         )
@@ -550,7 +742,8 @@ if __name__ == "__main__":
             f" global_step={args.total_timesteps},"
             f" return_mean={final_eval_returns.mean().item():.3f},"
             f" length_mean={final_eval_lengths.mean().item():.1f},"
-            f" full_length_fraction={float(final_full_length_fraction):.3f}"
+            f" full_length_fraction={float(final_full_length_fraction):.3f},"
+            f" position_error_rms={final_eval_metrics['position_error_rms']:.4f}"
         )
 
     envs.close()

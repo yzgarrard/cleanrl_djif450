@@ -100,6 +100,11 @@ class TacDroneHoverEnvV04(gym.Env):
             dtype=np.float32,
         )
         self.last_action = np.zeros(4, dtype=np.float32)
+        hover_thrust = self.model.body_mass.sum() * 9.81
+        self.hover_action = np.array(
+            [2.0 * hover_thrust / self.max_thrust - 1.0, 0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
 
         # --- Reward weights ---
         self.w_z    = 3.0
@@ -160,6 +165,7 @@ class TacDroneHoverEnvV04(gym.Env):
         eul = R.from_quat(quat, scalar_first=True).as_euler("zyx", degrees=False)
         yaw = eul[0]
         action_delta = action_normed - self.last_action
+        action_error = action_normed - self.hover_action
         reward_terms = {
             "alive": float(self.alive),
             "z": float(-self.w_z * z_err**2),
@@ -168,21 +174,28 @@ class TacDroneHoverEnvV04(gym.Env):
             "ang": float(-self.w_ang * float(np.dot(gyro, gyro))),
             "tilt": float(-self.w_tilt * tilt**2),
             "yaw": float(-self.w_yaw * yaw**2),
-            # "act": float(-self.w_act * float(np.sum(action_normed**2))),
+            "act": float(-self.w_act * float(np.sum(action_error**2))),
             "act_delta": float(-self.w_act_delta * float(np.sum(action_delta**2))),
             "termination": 0.0,
         }
         reward_terms["total"] = float(sum(reward_terms.values()))
         return reward_terms["total"], reward_terms
 
-    def _is_terminated(self) -> bool:
+    def _termination_reason(self) -> str | None:
         pos  = self.data.qpos[:3]
         tilt = self._tilt_angle()
-        if pos[2] < 0.05:                            return True
-        if abs(self.pos_des[2] - pos[2]) > 3.0:        return True
-        if abs(pos[0]) > 5.0 or abs(pos[1]) > 5.0:  return True
-        if tilt > np.deg2rad(60):                     return True
-        return False
+        if pos[2] < 0.05:
+            return "ground_contact"
+        if abs(self.pos_des[2] - pos[2]) > 3.0:
+            return "altitude_error"
+        if abs(pos[0]) > 5.0 or abs(pos[1]) > 5.0:
+            return "xy_bounds"
+        if tilt > np.deg2rad(60):
+            return "excessive_tilt"
+        return None
+
+    def _is_terminated(self) -> bool:
+        return self._termination_reason() is not None
 
     # ------------------------------------------------------------------ #
     #  Gymnasium API                                                       #
@@ -229,16 +242,27 @@ class TacDroneHoverEnvV04(gym.Env):
         self.rollrate_err_accum += omega_err[0]*self.dt
         self.pitchrate_err_accum += omega_err[1]*self.dt
         self.yawrate_err_accum   += omega_err[2]*self.dt
-        
-        # i_limits = self.max_i_torque / np.array([
-        #     self.MC_ROLLRATE_I,
-        #     self.MC_PITCHRATE_I,
-        #     self.MC_YAWRATE_I,
-        # ])
-        
-        # self.rollrate_err_accum = np.clip(self.rollrate_err_accum, -i_limits[0], i_limits[0])
-        # self.pitchrate_err_accum = np.clip(self.pitchrate_err_accum, -i_limits[1], i_limits[1])
-        # self.yawrate_err_accum = np.clip(self.yawrate_err_accum, -i_limits[2], i_limits[2])
+
+        i_gains = np.array([
+            self.MC_ROLLRATE_I,
+            self.MC_PITCHRATE_I,
+            self.MC_YAWRATE_I,
+        ])
+        i_limits = np.divide(
+            self.max_i_torque,
+            i_gains,
+            out=np.zeros_like(self.max_i_torque),
+            where=i_gains != 0.0,
+        )
+        self.rollrate_err_accum = np.clip(
+            self.rollrate_err_accum, -i_limits[0], i_limits[0]
+        )
+        self.pitchrate_err_accum = np.clip(
+            self.pitchrate_err_accum, -i_limits[1], i_limits[1]
+        )
+        self.yawrate_err_accum = np.clip(
+            self.yawrate_err_accum, -i_limits[2], i_limits[2]
+        )
 
         
         tau_sp_P = np.array([
@@ -267,13 +291,16 @@ class TacDroneHoverEnvV04(gym.Env):
             
         obs        = self._get_obs()
         reward, reward_terms = self._compute_reward(action)
-        terminated = self._is_terminated()
+        termination_reason = self._termination_reason()
+        terminated = termination_reason is not None
         if terminated:
             reward_terms["termination"] = -200.0  # large penalty for crashing/going out of bounds
             reward = float(reward + reward_terms["termination"])
             reward_terms["total"] = reward
         self._step_count += 1
         truncated  = self._step_count >= self.max_episode_steps
+        if truncated and termination_reason is None:
+            termination_reason = "time_limit"
         self.last_action = action.copy()
 
         info = {
@@ -284,6 +311,7 @@ class TacDroneHoverEnvV04(gym.Env):
             "y_err": float(self.pos_des[1] - self.data.qpos[1]),
             "pos_des": self.pos_des.copy(),
             "reward_terms": reward_terms,
+            "termination_reason": termination_reason,
         }
         return obs, reward, terminated, truncated, info
 

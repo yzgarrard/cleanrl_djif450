@@ -4,10 +4,20 @@ import torch.nn as nn
 
 
 class DronePolicy(nn.Module):
-    def __init__(self, actor, obs_mean, obs_var, obs_epsilon, action_low, action_high):
+    def __init__(
+        self,
+        actor,
+        obs_mean,
+        obs_var,
+        obs_epsilon,
+        action_low,
+        action_high,
+        squash_actions=False,
+    ):
         super().__init__()
         self.actor = actor
         self.obs_epsilon = float(obs_epsilon)
+        self.squash_actions = bool(squash_actions)
         self.register_buffer("obs_mean", torch.as_tensor(obs_mean, dtype=torch.float32))
         self.register_buffer("obs_var", torch.as_tensor(obs_var, dtype=torch.float32))
         self.register_buffer("action_low", torch.as_tensor(action_low, dtype=torch.float32))
@@ -23,7 +33,12 @@ class DronePolicy(nn.Module):
         obs = (obs - self.obs_mean) / torch.sqrt(self.obs_var + self.obs_epsilon)
         obs = torch.clamp(obs, -10.0, 10.0)
         action = self.actor(obs)
-        action = torch.clamp(action, self.action_low, self.action_high)
+        if getattr(self, "squash_actions", False):
+            action_scale = (self.action_high - self.action_low) / 2.0
+            action_bias = (self.action_high + self.action_low) / 2.0
+            action = torch.tanh(action) * action_scale + action_bias
+        else:
+            action = torch.clamp(action, self.action_low, self.action_high)
 
         if single_obs:
             action = action.squeeze(0)

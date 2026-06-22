@@ -7,9 +7,11 @@ import torch
 import custom_envs
 from cleanrl_drone.sac_continuous_action_mujoco_v01 import (
     Actor,
+    ACTION_NAMES,
     REWARD_TERM_NAMES,
     accumulate_reward_terms,
     get_actor_statistics,
+    maybe_save_best_actor,
     run_deterministic_eval,
 )
 
@@ -50,6 +52,15 @@ class TestSacDroneDiagnostics(unittest.TestCase):
         self.assertLessEqual(statistics["sampled_action_saturation_fraction"], 1.0)
         self.assertGreaterEqual(statistics["deterministic_action_saturation_fraction"], 0.0)
         self.assertLessEqual(statistics["deterministic_action_saturation_fraction"], 1.0)
+        for action_name in ACTION_NAMES:
+            self.assertIn(
+                f"sampled_{action_name}_saturation_fraction",
+                statistics,
+            )
+            self.assertIn(
+                f"deterministic_{action_name}_saturation_fraction",
+                statistics,
+            )
 
     def test_reward_term_aggregation_handles_vector_and_final_info(self):
         normal_terms = {name: 1.0 for name in REWARD_TERM_NAMES}
@@ -78,22 +89,104 @@ class TestSacDroneDiagnostics(unittest.TestCase):
             for name, parameter in self.actor.state_dict().items()
         }
 
-        returns, lengths, max_episode_steps = run_deterministic_eval(
+        returns, lengths, max_episode_steps, metrics = run_deterministic_eval(
             actor=self.actor,
             env_id="custom_envs/TacDroneHover-v4",
             device=torch.device("cpu"),
             eval_episodes=1,
             eval_seed=456,
+            settling_seconds=0.0,
         )
 
         self.assertEqual(returns.shape, (1,))
         self.assertEqual(lengths.shape, (1,))
         self.assertEqual(max_episode_steps, 1000)
+        self.assertIn("position_error_rms", metrics)
+        self.assertIn("termination/time_limit_fraction", metrics)
+        for action_name in ACTION_NAMES:
+            self.assertIn(f"{action_name}_saturation_fraction", metrics)
+        termination_fraction = sum(
+            value
+            for name, value in metrics.items()
+            if name.startswith("termination/")
+        )
+        self.assertAlmostEqual(termination_fraction, 1.0)
         np.testing.assert_array_equal(training_env.data.qpos, qpos_before)
         self.assertEqual(training_env._step_count, step_count_before)
         for name, parameter in self.actor.state_dict().items():
             with self.subTest(parameter=name):
                 self.assertTrue(torch.equal(parameter, actor_before[name]))
+
+    def test_best_actor_requires_full_length_and_improves_tracking(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as run_dir:
+            best, path = maybe_save_best_actor(
+                actor=self.actor,
+                run_dir=run_dir,
+                global_step=100,
+                full_length_fraction=0.95,
+                eval_metrics={"position_error_rms": 0.1},
+                best_position_error_rms=np.inf,
+            )
+            self.assertTrue(np.isinf(best))
+            self.assertIsNone(path)
+
+            best, path = maybe_save_best_actor(
+                actor=self.actor,
+                run_dir=run_dir,
+                global_step=200,
+                full_length_fraction=1.0,
+                eval_metrics={"position_error_rms": 0.1},
+                best_position_error_rms=best,
+            )
+            self.assertEqual(best, 0.1)
+            self.assertIsNotNone(path)
+
+            unchanged_best, path = maybe_save_best_actor(
+                actor=self.actor,
+                run_dir=run_dir,
+                global_step=300,
+                full_length_fraction=1.0,
+                eval_metrics={"position_error_rms": 0.2},
+                best_position_error_rms=best,
+            )
+            self.assertEqual(unchanged_best, best)
+            self.assertIsNone(path)
+
+
+class TestTacDroneControllerAndReward(unittest.TestCase):
+    def setUp(self):
+        self.env = gym.make("custom_envs/TacDroneHover-v4").unwrapped
+        self.env.reset(seed=123)
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_hover_centered_action_penalty(self):
+        self.env.last_action = self.env.hover_action.copy()
+        _, hover_terms = self.env._compute_reward(self.env.hover_action.copy())
+        _, saturated_terms = self.env._compute_reward(np.ones(4, dtype=np.float32))
+
+        self.assertAlmostEqual(hover_terms["act"], 0.0)
+        self.assertLess(saturated_terms["act"], 0.0)
+
+    def test_rate_integrators_are_clipped(self):
+        self.env.rollrate_err_accum = 1e6
+        self.env.pitchrate_err_accum = -1e6
+        self.env.yawrate_err_accum = 1e6
+        self.env.step(self.env.hover_action.copy())
+        limits = self.env.max_i_torque / np.array(
+            [
+                self.env.MC_ROLLRATE_I,
+                self.env.MC_PITCHRATE_I,
+                self.env.MC_YAWRATE_I,
+            ]
+        )
+
+        self.assertLessEqual(abs(self.env.rollrate_err_accum), limits[0])
+        self.assertLessEqual(abs(self.env.pitchrate_err_accum), limits[1])
+        self.assertLessEqual(abs(self.env.yawrate_err_accum), limits[2])
 
 
 if __name__ == "__main__":
