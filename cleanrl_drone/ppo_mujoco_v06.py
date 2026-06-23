@@ -1,29 +1,31 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
 import os
 import random
 import time
-import copy
+# import copy
 from dataclasses import dataclass
 
 import gymnasium as gym
+from gymnasium.wrappers.clip_action import ClipAction
+from gymnasium.wrappers.flatten_observation import FlattenObservation
+from gymnasium.wrappers.normalize import NormalizeObservation, NormalizeReward
+from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
+from gymnasium.wrappers.transform_observation import TransformObservation
+from gymnasium.wrappers.transform_reward import TransformReward
 import custom_envs
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.adam import Adam
 import tyro
 from torch.distributions.normal import Normal
-from torch.utils.tensorboard import SummaryWriter
-
-from cleanrl_drone.deploy_policy import DronePolicy
-
-# This script is specifically for dji_f450.py.
+from torch.utils.tensorboard.writer import SummaryWriter
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 4
+    seed: int = 1
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
@@ -33,7 +35,7 @@ class Args:
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str | None = None
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
@@ -77,8 +79,18 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
-    target_kl: float = None
+    target_kl: float | None = None
     """the target KL divergence threshold"""
+    deterministic_eval_interval: int = 50_000
+    """run deterministic evaluation every N training steps; set <= 0 to disable"""
+    deterministic_eval_episodes: int = 20
+    """number of fixed-seed deterministic evaluation episodes"""
+    deterministic_eval_seed: int = 10_000
+    """base seed reused at every deterministic evaluation"""
+    final_deterministic_eval_episodes: int = 10
+    """number of final deterministic evaluation episodes"""
+    final_deterministic_eval_seed: int = 20_000
+    """base seed for final deterministic evaluation"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -88,36 +100,112 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
-
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+        env = FlattenObservation(env)  # deal with dm_control's Dict observation space
+        env = RecordEpisodeStatistics(env)
+        env = ClipAction(env)
+        env = NormalizeObservation(env)
+        env = TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = NormalizeReward(env, gamma=gamma)
+        env = TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
-
     return thunk
 
+def make_deterministic_eval_env(env_id):
+    env = gym.make(env_id)
+    env = FlattenObservation(env)
+    env = RecordEpisodeStatistics(env)
+    env = ClipAction(env)
+    return env
 
 def find_normalize_observation_wrapper(env):
     while True:
-        if isinstance(env, gym.wrappers.NormalizeObservation):
+        if isinstance(env, NormalizeObservation):
             return env
         if not hasattr(env, "env"):
-            raise RuntimeError("NormalizeObservation wrapper not found; cannot export deployment policy")
+            raise RuntimeError("NormalizeObservation wrapper not found")
         env = env.env
+
+def normalize_eval_obs(obs, obs_mean, obs_var, obs_epsilon, device):
+    obs = (obs - obs_mean) / np.sqrt(obs_var + obs_epsilon)
+    obs = np.clip(obs, -10.0, 10.0)
+    return torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+
+
+def run_deterministic_eval(
+    agent,
+    env_id,
+    obs_mean,
+    obs_var,
+    obs_epsilon,
+    device,
+    eval_episodes,
+    eval_seed,
+):
+    eval_env = make_deterministic_eval_env(env_id)
+    max_episode_steps = getattr(eval_env.unwrapped, "max_episode_steps", None)
+    episodic_returns = []
+    episodic_lengths = []
+    try:
+        for episode_idx in range(eval_episodes):
+            obs, _ = eval_env.reset(seed=eval_seed + episode_idx)
+            terminated = truncated = False
+            episodic_return = 0.0
+            episodic_length = 0
+            while not (terminated or truncated):
+                with torch.no_grad():
+                    normalized_obs = normalize_eval_obs(
+                        obs, obs_mean, obs_var, obs_epsilon, device
+                    )
+                    action = agent.get_deterministic_action(normalized_obs)
+                action_np = action.squeeze(0).cpu().numpy()
+                obs, reward, terminated, truncated, _ = eval_env.step(action_np)
+                episodic_return += float(reward)
+                episodic_length += 1
+
+            episodic_returns.append(episodic_return)
+            episodic_lengths.append(episodic_length)
+    finally:
+        eval_env.close()
+
+    return (
+        np.asarray(episodic_returns, dtype=np.float32),
+        np.asarray(episodic_lengths, dtype=np.float32),
+        max_episode_steps,
+    )
+
+
+def log_deterministic_eval(
+    writer,
+    prefix,
+    eval_returns,
+    eval_lengths,
+    eval_max_episode_steps,
+    global_step,
+    log_episode_lengths=False,
+):
+    if eval_max_episode_steps is None:
+        full_length_fraction = np.nan
+    else:
+        full_length_fraction = np.mean(eval_lengths >= eval_max_episode_steps)
+    writer.add_scalar(f"{prefix}/episodic_return_mean", eval_returns.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/episodic_return_min", eval_returns.min().item(), global_step)
+    writer.add_scalar(f"{prefix}/episodic_return_max", eval_returns.max().item(), global_step)
+    writer.add_scalar(f"{prefix}/episodic_length_mean", eval_lengths.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/full_length_fraction", float(full_length_fraction), global_step)
+    for idx, (episodic_return, episodic_length) in enumerate(zip(eval_returns, eval_lengths)):
+        writer.add_scalar(f"{prefix}/episodic_return", episodic_return.item(), global_step + idx)
+        if log_episode_lengths:
+            writer.add_scalar(f"{prefix}/episodic_length", episodic_length.item(), global_step + idx)
+    return full_length_fraction
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
-
 
 class Agent(nn.Module):
     def __init__(self, envs):
@@ -150,13 +238,18 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
+    def get_deterministic_action(self, x):
+        return self.actor_mean(x)
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{time.strftime('%Y%m%d_%H%M%S')}"
+    run_name = (
+        f"{args.env_id}__{args.exp_name}__"
+        f"{time.strftime('%Y%m%d_%H%M%S')}__{args.seed}"
+    )
     if args.track:
         import wandb
 
@@ -190,9 +283,10 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    optimizer = Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
+    assert isinstance(envs.single_observation_space, gym.spaces.Box), "only Box observation space is supported"
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -202,6 +296,7 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
+    next_deterministic_eval_step = args.deterministic_eval_interval
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
@@ -314,7 +409,7 @@ if __name__ == "__main__":
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
-            if args.target_kl is not None and approx_kl > args.target_kl:
+            if args.target_kl is not None and approx_kl > args.target_kl: # pyright: ignore[reportPossiblyUnboundVariable]
                 break
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
@@ -323,56 +418,76 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("losses/value_loss", v_loss.item(), global_step) # pyright: ignore[reportPossiblyUnboundVariable]
+        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step) # pyright: ignore[reportPossiblyUnboundVariable]
+        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step) # pyright: ignore[reportPossiblyUnboundVariable]
+        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step) # pyright: ignore[reportPossiblyUnboundVariable]
+        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step) # pyright: ignore[reportPossiblyUnboundVariable]
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-    if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-        torch.save(agent.state_dict(), model_path)
-        print(f"model saved to {model_path}")
+        if (
+            args.deterministic_eval_interval > 0
+            and args.deterministic_eval_episodes > 0
+            and global_step >= next_deterministic_eval_step
+        ):
+            normalize_wrapper = find_normalize_observation_wrapper(envs.envs[0])
+            eval_returns, eval_lengths, eval_max_episode_steps = run_deterministic_eval(
+                agent=agent,
+                env_id=args.env_id,
+                obs_mean=normalize_wrapper.obs_rms.mean.copy(),
+                obs_var=normalize_wrapper.obs_rms.var.copy(),
+                obs_epsilon=normalize_wrapper.epsilon,
+                device=device,
+                eval_episodes=args.deterministic_eval_episodes,
+                eval_seed=args.deterministic_eval_seed,
+            )
+            full_length_fraction = log_deterministic_eval(
+                writer=writer,
+                prefix="deterministic_eval",
+                eval_returns=eval_returns,
+                eval_lengths=eval_lengths,
+                eval_max_episode_steps=eval_max_episode_steps,
+                global_step=global_step,
+            )
+            print(
+                "deterministic_eval:"
+                f" global_step={global_step},"
+                f" episodes={len(eval_returns)},"
+                f" return_mean={eval_returns.mean().item():.3f},"
+                f" length_mean={eval_lengths.mean().item():.1f},"
+                f" full_length_fraction={float(full_length_fraction):.3f}"
+            )
+            while global_step >= next_deterministic_eval_step:
+                next_deterministic_eval_step += args.deterministic_eval_interval
 
-        normalize_obs_wrapper = find_normalize_observation_wrapper(envs.envs[0])
-        deploy_agent = DronePolicy(
-            actor=copy.deepcopy(agent.actor_mean).cpu(),
-            obs_mean=normalize_obs_wrapper.obs_rms.mean,
-            obs_var=normalize_obs_wrapper.obs_rms.var,
-            obs_epsilon=normalize_obs_wrapper.epsilon,
-            action_low=envs.single_action_space.low,
-            action_high=envs.single_action_space.high,
-        )
-        deploy_agent.eval()
-        deploy_path = f"runs/{run_name}/{args.exp_name}.deploy_policy.pt"
-        torch.save(deploy_agent, deploy_path)
-        print(f"deployment policy saved to {deploy_path}")
+    # if args.save_model:
+    #     model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+    #     torch.save(agent.state_dict(), model_path)
+    #     print(f"model saved to {model_path}")
+    #     from cleanrl_utils.evals.ppo_eval import evaluate
 
-        from cleanrl_utils.evals.ppo_eval import evaluate
+    #     episodic_returns = evaluate(
+    #         model_path,
+    #         make_env,
+    #         args.env_id,
+    #         eval_episodes=10,
+    #         run_name=f"{run_name}-eval",
+    #         Model=Agent,
+    #         device=device,
+    #         gamma=args.gamma,
+    #     )
+    #     for idx, episodic_return in enumerate(episodic_returns):
+    #         writer.add_scalar("eval/episodic_return", episodic_return, idx)
 
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=Agent,
-            device=device,
-            gamma=args.gamma,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
+        # if args.upload_model:
+        #     from cleanrl_utils.huggingface import push_to_hub
 
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
-
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
+        #     repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
+        #     repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
+        #     push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     envs.close()
     writer.close()

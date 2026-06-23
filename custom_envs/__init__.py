@@ -4,3 +4,4 @@ from custom_envs.envs import TacDroneHoverEnv
 from custom_envs.envs import TacDroneHoverEnvV02
 from custom_envs.envs import TacDroneHoverEnvV03
 from custom_envs.envs import TacDroneHoverEnvV04
+from custom_envs.envs import TacDroneHoverEnvV05
